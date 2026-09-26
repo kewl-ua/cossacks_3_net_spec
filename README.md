@@ -43,15 +43,15 @@ for block in stream.parse(payload):            # a LAN_RECORD (0x04B0) payload
 ```
 
 Recordings are in the QLREC1 format of the [QLadder](https://qladder.com)
-recorder (spec, section 8). A packet capture of the lobby port works too:
+recorder (spec, section 10). A packet capture of the lobby port works too:
 split the TCP stream into frames with `c3net.lobby.read_frames`.
 
 Upgrade numbers depend on the game's scripts. `python -m c3net upgrades
-<game folder>` rebuilds the list from your installation (7.5).
+<game folder>` rebuilds the list from your installation (9.5).
 
 ## Status
 
-- Revision 0.1 describes version 2.2.3 with unmodded scripts.
+- Revision 0.2 describes version 2.2.3 with unmodded scripts.
 - Every record layout comes from the game's own script handlers.
 - Checked on recorded matches: every block decodes, and the statistics
   balance with the game's end screen.

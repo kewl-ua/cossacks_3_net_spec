@@ -1,4 +1,4 @@
-"""Room data: the game name, the lobby status and the room datasync. See cossacks3-net.md, section 4."""
+"""Room data: the game name, the lobby status and the room datasync. See cossacks3-net.md, sections 6.3.1 and 7."""
 
 import re
 from typing import Optional

@@ -1,12 +1,12 @@
-"""The match stream: LAN_RECORD (0x04B0) payloads. See cossacks3-net.md, section 5.
+"""The match stream: LAN_RECORD (0x04B0) payloads. See cossacks3-net.md, section 8.
 
 Cossacks 3 is host-authoritative: the host runs the simulation and sends its
 results to the other players. A payload is a sequence of blocks:
 
-    00 03 OO SS 00 <body> 01    a record of a script state machine (5.3):
+    00 03 OO SS 00 <body> 01    a record of a script state machine (8.1):
                                 OO owner (player 0-11, 14 = "progress"),
                                 SS section index in the machine's .aix file
-    09 <u24> <u32 n> <n units>  unit state sync (5.6)
+    09 <u24> <u32 n> <n units>  unit state sync (8.7)
 
     >>> for block in parse(payload):
     ...     if isinstance(block, Record) and block.name == "ReadNew":

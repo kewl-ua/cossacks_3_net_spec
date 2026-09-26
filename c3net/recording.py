@@ -1,4 +1,4 @@
-"""QLREC1: match recordings written by the QLadder recorder (a Sich module). See cossacks3-net.md, section 7.
+"""QLREC1: match recordings written by the QLadder recorder (a Sich module). See cossacks3-net.md, section 10.
 
     "QLREC1\n", then for every frame a room member sent:
         u32 ms since the room was created, u32 payload length, u16 code, u32 id from, u32 id to, payload

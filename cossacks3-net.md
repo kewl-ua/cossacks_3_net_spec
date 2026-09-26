@@ -2,34 +2,47 @@
 
 | | |
 |---|---|
-| Revision | 0.1, 2026-09-26 |
+| Revision | 0.2, 2026-09-26 |
 | Game version | 2.2.3 (core 1.0.0.7), unmodded scripts (room checksum `3EEB`) |
-| Status | Reverse-engineered, verified on recorded matches |
+| Status | Reverse-engineered; checked on recorded matches |
 | Reference implementation | [`c3net`](c3net/) (Python, this repository) |
 
-This document describes what travels between Cossacks 3 and its lobby server
-during an online game: the lobby frames, the room data, and — the main part —
-the **match stream** in which the game host sends the state of the match to
-the other players. With it, a lobby server can follow a match as it happens:
-units trained and lost, buildings, upgrades, resources gathered and spent,
-positions, fights and the result, with no mod on the players' side.
+This document describes everything Cossacks 3 exchanges with its lobby server:
 
-Not affiliated with GSC Game World. No game files are included here; the
-layouts were read from the game's own script handlers (`Write*` / `Read*`
-sections of the `.aix` state machines, `dmscript.global` constants) and
-checked against real matches.
+- **the lobby frame** and every message code;
+- **the parsers**, the game's own key/value messages inside rooms and matches;
+- **the match stream**, in which the game host sends the state of a match to
+  the other players.
+
+With it, a lobby server can follow a match as it happens: units trained and
+lost, buildings placed and finished, upgrades, resources, positions, fights
+and the result, with no mod on the players' side.
+
+Not affiliated with GSC Game World. No game files are included here. The
+layouts were read from the game's own script handlers (the `Write*` / `Read*`
+sections of its `.aix` state machines, the `dmscript.global` constants) and
+from [Sich](https://github.com/3skcassoc/sich), an open lobby server. They
+were checked against recorded matches.
 
 ## Contents
 
-1. [Introduction](#1-introduction)
-2. [Architecture](#2-architecture)
-3. [Data types](#3-data-types)
-4. [Lobby protocol](#4-lobby-protocol)
-5. [Rooms](#5-rooms)
-6. [The match stream](#6-the-match-stream)
-7. [What the data means](#7-what-the-data-means)
-8. [QLREC1 recordings](#8-qlrec1-recordings)
-9. [Constants](#9-constants)
+- [1. Introduction](#1-introduction)
+  - [1.1 Scope](#11-scope) · [1.2 Verification](#12-verification) · [1.3 Conventions](#13-conventions) · [1.4 Terms](#14-terms)
+- [2. Architecture](#2-architecture)
+- [3. Data types](#3-data-types)
+- [4. Lobby frame](#4-lobby-frame)
+  - [4.1 Frame construction](#41-frame-construction) · [4.2 Addresses](#42-addresses) · [4.3 Message codes](#43-message-codes) · [4.4 Flow of a match](#44-flow-of-a-match)
+- [5. Lobby messages](#5-lobby-messages)
+  - [5.1 Connection and accounts](#51-connection-and-accounts) · [5.2 Chat](#52-chat) · [5.3 Rooms](#53-rooms) · [5.4 In-room game messages](#54-in-room-game-messages) · [5.5 Enumerations](#55-enumerations)
+- [6. Parsers](#6-parsers)
+  - [6.1 Tree encoding](#61-tree-encoding) · [6.2 Parser ids](#62-parser-ids) · [6.3 Parser definitions](#63-parser-definitions)
+- [7. Room data](#7-room-data)
+  - [7.1 Game name](#71-game-name) · [7.2 Lobby status](#72-lobby-status) · [7.3 Teams](#73-teams) · [7.4 Result codes](#74-result-codes)
+- [8. The match stream (`0x04B0 LAN_RECORD`)](#8-the-match-stream-0x04b0-lan_record)
+  - [8.1 Block construction](#81-block-construction) · [8.2 Owners](#82-owners) · [8.3 Record types](#83-record-types) · [8.4 Body values](#84-body-values) · [8.5 Progress records](#85-progress-records) · [8.6 Player records](#86-player-records) · [8.7 Sync block](#87-sync-block) · [8.8 Decoding robustly](#88-decoding-robustly)
+- [9. What the data means](#9-what-the-data-means)
+- [10. QLREC1 recordings](#10-qlrec1-recordings)
+- [11. Enumerations](#11-enumerations)
 - [Appendix A. Annotated examples](#appendix-a-annotated-examples)
 - [Appendix B. Reference implementation](#appendix-b-reference-implementation)
 - [Appendix C. Revision history](#appendix-c-revision-history)
@@ -42,49 +55,64 @@ checked against real matches.
 
 Covered:
 
-- the lobby frame and the messages a match goes through (create, update,
-  lock, parsers, scores, close);
-- room data: the game name, the lobby status string, the room datasync
-  (slots, map and game settings), results;
-- the match stream (`LAN_RECORD`, code `0x04B0`): its two block types and
-  the layout of every record the host sends;
-- what the values mean, including pitfalls in the game's own statistics.
+- the lobby frame, every message code, and the payload of every message the
+  reference lobby server parses;
+- the parsers: the game's key/value messages, and the ones that carry room
+  state, results and game time;
+- room data: the game name, the lobby status string, the room datasync;
+- the match stream: its signature bytes, its two block types and the layout
+  of every record;
+- what the values mean, including traps in the game's own statistics.
 
-Not covered: the lobby's account and social messages (clans, friends, chats —
-see [Sich](https://github.com/3skcassoc/sich) `xpacket.lua`, which parses all
-of them), saved games, map generation, historical battles and scenarios.
+Not covered:
+
+- the payloads of the social messages (friends, chats, clans, members,
+  admins, stats: codes `0x01C2`–`0x01DF`). They are listed, but their layout
+  is not documented.
+- saved games, map generation, historical battles.
 
 ### 1.2 Verification
 
-- Every record layout in section 6 comes from the game's handler that reads
-  it and was checked on recorded matches of version 2.2.3: all blocks of
-  every recording decode, each record ending exactly at its end marker.
-- The recordings were one human against computer players. Two-human matches
-  (client requests, 6.1) follow the same scripts but are not yet verified.
-- The statistics (section 7) were compared with the game's end screen. The
-  numbers balance to the unit once the rules in 7.4 are applied.
+- **Record layouts** (section 8) come from the handler that reads each
+  record in the game's scripts. On recorded 2.2.3 matches, every block
+  decodes and every record ends exactly on its end byte.
+- **Statistics** (section 9) were compared with the game's end screen and
+  balance to the unit once 9.4 is applied.
+- **Lobby payloads** (section 5) follow Sich, which serves the game.
+- **Not yet verified:** the recordings were one human against computer
+  players. What only happens between two humans (client requests in 8.3,
+  parser 16) follows the scripts but has not been observed.
 
 ### 1.3 Conventions
 
-- All integers are **little-endian**.
-- Offsets and sizes are in bytes.
-- `0x` numbers are hexadecimal.
-- Field names in `snake_case` are this document's; names in `CamelCase` or
-  with a `gc_` / `g` prefix are the game's own.
-- "Slot" is a player's index in the room (`gMap.players[slot]`, 0–11).
-  "Id" (`lanid`) is a player's lobby account number.
+- Integers are **little-endian**. Floats are IEEE 754.
+- Payloads are shown as C structs. The types are those of section 3. `[]`
+  is a list whose length is given in the comment. Fields that are only
+  present sometimes say when.
+- `0x` numbers are hexadecimal. "Bit *n*" counts from 0, the least
+  significant bit.
+- Field names in `snake_case` are this document's. Names in `CamelCase` or
+  with a `gc_` / `g` prefix are the game's own. Message names are Sich's.
+
+> [!NOTE]
+> Notes give context.
+
+> [!WARNING]
+> Warnings mark behaviour that is easy to get wrong.
 
 ### 1.4 Terms
 
 | Term | Meaning |
 |---|---|
-| Lobby server | The server the game connects to for accounts and rooms. The original is gone; [Sich](https://github.com/3skcassoc/sich) is a compatible open implementation. |
-| Room / session | A game lobby that becomes a match. The player who created it is the **master**. |
-| Host | The room master once the match starts. It runs the simulation. |
-| Client | Every other player (and spectators). |
-| Machine | A script state machine of the game (`.aix` file). Each player has a *global* machine; there is one *progress* machine. |
-| Section | A named block of script in a machine; records refer to it by its index. |
-| Record | One message of the match stream: "run this section with this data". |
+| Lobby server | Where the game logs in and finds rooms. The original is gone; Sich is a compatible open implementation. |
+| Client | The game program of one player (or spectator). |
+| Room / session | A game lobby that becomes a match. Its creator is the **master**. |
+| Host | The master, once the match starts: it runs the simulation. |
+| Id | A player's lobby account number (the game's `lanid`). |
+| Slot | A player's place in the room, 0–11 (`gMap.players[slot]`). |
+| Machine | A script state machine (`.aix` file). Every slot has a *global* machine; there is one *progress* machine. |
+| Section | A named block of script in a machine. Records name it by its index. |
+| Record | One message of the match stream: "run this section of this machine with this data". |
 | Sync block | The engine's own message with unit states and positions. |
 | uid | A game object's unique id: units, buildings, fields, trees. |
 
@@ -92,189 +120,862 @@ of them), saved games, map generation, historical battles and scenarios.
 
 ## 2. Architecture
 
-```
-          TCP 31523                          TCP 31523
- client ───────────────┐                ┌─────────────── client
-                       │  lobby server  │
- host ─────────────────┘  (relays room  └─────────────── spectator
-                           traffic)
+```mermaid
+flowchart LR
+    A[client] <-->|TCP 31523| L[lobby server]
+    H[host = room master] <-->|TCP 31523| L
+    S[spectator] <-->|TCP 31523| L
 ```
 
-- The game connects to the lobby server at the address in
-  `data/resources/servers.dat` (`* = host:port`, port 31523). Nothing is
-  peer-to-peer: in a room, every message goes to the server, which relays it
-  to the other room members.
-- **The game is host-authoritative, not lockstep.**
-  - The host runs the simulation. It sends each state change to the others
-    as a *record* ("run section `ReadNew` of player 3's machine with this
-    data") or as a *sync block* (unit states and positions).
-  - A client that acts (hires, builds, orders) sends its own record to the
-    host as a request. The host checks it, applies it and broadcasts the
-    result.
-- So one observer — the lobby server — sees the whole match: every unit,
-  building, upgrade, resource and death, as the host decided it.
+- The game connects to the lobby server named in
+  `data/resources/servers.dat`: `* = host:port`, port 31523.
+- There is **no peer-to-peer traffic**. Inside a room, every message goes to
+  the lobby server, which relays it to the other members.
+- **The game is host-authoritative, not lockstep:**
+
+```mermaid
+sequenceDiagram
+    participant C as client (slot 1)
+    participant L as lobby server
+    participant H as host (slot 0)
+    C->>L: LAN_RECORD: ReadConstruct, owner 1, server = 0 (a request: "build a mill here")
+    L->>H: relayed
+    Note over H: checks resources, pays
+    H->>L: LAN_RECORD: ReadConstruct, owner 1, server = 1
+    L->>C: relayed to every member
+    Note over H: the simulation runs
+    H->>L: LAN_RECORD: sync blocks (the mill appears and is built, positions, deaths)
+    L->>C: relayed
+```
+
+The lobby server therefore sees the whole match, as the host decided it.
 
 ---
 
 ## 3. Data types
 
-### 3.1 Lobby payloads
+### 3.1 Lobby payload types
 
-| Type | Size | Encoding |
-|---|---|---|
-| `u8` | 1 | unsigned |
-| `bool` | 1 | 0 false, anything else true |
-| `u16` | 2 | unsigned |
-| `u32` / `i32` | 4 | unsigned / two's complement |
-| `str8` | 1 + n | `u8` length, then the bytes |
-| `str16` | 2 + n | `u16` length, then the bytes |
-| `str32` | 4 + n | `u32` length, then the bytes |
-| `version` | 1 + n | `str8` like `"1.0.0.7"`; Sich packs it as one byte per part: `0x01000007` |
-| `datetime` | 8 | IEEE double, days since 1899-12-30 (Delphi `TDateTime`) |
-| `parser` | ≥ 12 | a parser tree, 3.3 |
-
-Text in the lobby is the game's text as typed: Windows-1251 or UTF-8
-depending on the client. Decode as UTF-8, and fall back to Windows-1251.
-
-### 3.2 Match stream bodies
-
-Record bodies (6.4) use the game's `RecordCustomWrite*` encoding:
-
-| Type | Size | Encoding |
-|---|---|---|
-| `Boolean` / `Byte` | 1 | |
-| `Word` | 2 | `u16` |
-| `Integer` | 4 | `i32` |
-| `Float` | 4 | IEEE single |
-| `String` | 2 + n | `u16` length, then the bytes (object codes are ASCII) |
-
-### 3.3 Parser trees
-
-The game's key/value trees (`Parser*` functions) travel as nodes:
-
-| Offset | Type | Field |
-|---|---|---|
-| 0 | `str32` | key |
-| … | `str32` | value |
-| … | `u32` | number of children |
-| … | node × n | children, recursively |
-
-A message carrying a tree starts with a `u32` **parser id** (section 4.5).
-The root usually has an empty key and value.
-
-```
-0d 00 00 00                    parser id 13 (LAN_GAME_SESSION_RESULTS)
-00 00 00 00 00 00 00 00        root: key "", value ""
-02 00 00 00                    2 children
-  01 00 00 00 2a 00 00 00 00   key "*", value ""
-  03 00 00 00                  3 children
-    02 00 00 00 69 64  01 00 00 00 31  00 00 00 00    id = "1"
-    03 00 00 00 69 6e 64  01 00 00 00 30  00 00 00 00 ind = "0"
-    03 00 00 00 72 65 73  01 00 00 00 31  00 00 00 00 res = "1"
-  ...
-```
-
----
-
-## 4. Lobby protocol
-
-### 4.1 Frame
-
-Every message, both ways, is a frame:
-
-| Offset | Size | Type | Field |
+| Type | Size | Sich code | Encoding |
 |---|---|---|---|
-| 0 | 4 | `u32` | payload length |
-| 4 | 2 | `u16` | message code |
-| 6 | 4 | `u32` | sender's id (0 before login, or from the server) |
-| 10 | 4 | `u32` | recipient's id (0: the server / everyone) |
-| 14 | n | | payload |
+| `uint8_t` | 1 | `1` | unsigned byte |
+| `bool8_t` | 1 | `b` | 0 = false, anything else = true |
+| `uint16_t` | 2 | `2` | unsigned |
+| `uint32_t` / `int32_t` | 4 | `4` | unsigned / two's complement |
+| `str8_t` | 1 + n | `s` | `uint8_t n`, then n bytes |
+| `str16_t` | 2 + n | `w` | `uint16_t n`, then n bytes |
+| `str32_t` | 4 + n | `z` | `uint32_t n`, then n bytes |
+| `version_t` | 1 + n | `v` | `str8_t` such as `"1.0.0.7"`; Sich packs it as one byte per part: `0x01000007` |
+| `datetime_t` | 8 | `d`, `t` | IEEE double: days since 1899-12-30 (Delphi `TDateTime`); `unix = (d − 25569) × 86400` |
+| `parser_t` | ≥ 12 | `p` | a parser tree (6.1) |
+| `sized_parser_t` | 4 + n | `q` | `str32_t` whose bytes are a `parser_t` |
 
-Codes `SERVER_*` go from a client to the server, and `USER_*` from the
-server to a client. The server relays `LAN_*` codes between the members of a
-room, unchanged.
+> [!NOTE]
+> Text (nicknames, room names, chat) is what the player typed: Windows-1251
+> or UTF-8, depending on the client. Decode as UTF-8 and fall back to
+> Windows-1251.
 
-> **Security.** The protocol has no encryption or hashing: `SERVER_REGISTER`
-> and `SERVER_AUTHENTICATE` carry the e-mail and the password in clear text.
-> Anyone who can read the traffic, including the server's operator and its
-> logs, sees them. A server should not log payloads of these messages. Players
-> should not reuse a password they use elsewhere.
+### 3.2 Match stream body types
 
-### 4.2 Message codes
+Record bodies (8.4) use the game's `RecordCustomWrite*` / `RecordCustomRead*`:
 
-The codes a match uses. Sich names every code of the protocol.
-
-| Code | Name | Payload |
+| Game type | C type here | Size |
 |---|---|---|
-| `0x0032` | `LAN_PARSER` | `u32` parser id, `parser`: game messages inside a match (4.5) |
-| `0x0191` | `PING` | |
-| `0x0194` | `SERVER_SESSION_MSG` | `str8` text: room chat |
-| `0x0198` | `SERVER_REGISTER` | `version` core, `version` data, `str8` × 6 (e-mail, password, cd key, nickname, country, info) |
-| `0x019A` | `SERVER_AUTHENTICATE` | `version`, `version`, `str8` e-mail, `str8` password, `str8` cd key |
-| `0x019C` | `SERVER_SESSION_CREATE` | `u32` max players, `str8` password, `str8` game name (5.1), `str8` map name (5.2), `u32` money, `bool` fog of war, `u8` battlefield |
-| `0x019E` | `SERVER_SESSION_JOIN` | `u32` master's id |
-| `0x01A0` | `SERVER_SESSION_LEAVE` | — |
-| `0x01A2` | `SERVER_SESSION_LOCK` | `u32` n, n × (`u32` id, `u8` lobby team): the match starts |
-| `0x01AA` | `SERVER_SESSION_UPDATE` | `str8` game name, `str8` map name, `u32` money, `bool` fog, `u8` battlefield |
-| `0x01AB` | `SERVER_SESSION_CLIENT_UPDATE` | `u8` lobby team (5.4) |
-| `0x01AF` | `SERVER_SESSION_CLOSE` | — (the host closes the room at the end) |
-| `0x01B0` | `USER_SESSION_CLOSE` | `datetime`, `u32` n, n × (`u32` id, `u32` score) |
-| `0x01B7` | `SERVER_SESSION_CLSCORE` | `u32` id, `i32` result code (5.6) |
-| `0x01BB` | `SERVER_SESSION_PARSER` | `u32` parser id, `parser`: room messages to the master |
-| `0x01BC` | `USER_SESSION_PARSER` | `u32` parser id, `parser`, `u32` |
-| `0x0456` | `LAN_DO_START` | |
-| `0x0460` | `LAN_DO_READY` | |
-| `0x04B0` | `LAN_RECORD` | the match stream (section 6) |
+| `Boolean` | `bool8_t` | 1 |
+| `Byte` | `uint8_t` | 1 |
+| `Word` | `uint16_t` | 2 |
+| `Integer` | `int32_t` | 4 |
+| `Float` | `float` | 4 |
+| `String` | `str16_t` | 2 + n; object codes are ASCII |
 
-### 4.3 A match, message by message
-
-1. The master sends `SERVER_SESSION_CREATE`. Players `SERVER_SESSION_JOIN`.
-2. In the room, the master broadcasts the room state as parser 100
-   (`LAN_ROOM_SERVER_DATASYNC`, 5.3) whenever it changes. Clients send their
-   own changes as parser 102. `SERVER_SESSION_UPDATE` keeps the room's lobby
-   entry current (5.2).
-3. The master sends `SERVER_SESSION_LOCK`: the match starts.
-   `LAN_DO_START`, `LAN_DO_READY` and parsers 1–9 follow while the map loads.
-4. The match: `LAN_RECORD` frames (section 6), chat (`SERVER_SESSION_MSG`),
-   parser 10 when a player surrenders, and parser 14 when a client asks for
-   a resync.
-5. The host sends parser 13 with the results (5.5), `SERVER_SESSION_CLSCORE`
-   per player (5.6), and `SERVER_SESSION_CLOSE`.
-
-### 4.4 Relaying
-
-- The server (as Sich implements it) forwards `LAN_*` frames to the frame's
-  recipient, or to every other room member when the recipient is 0.
-- It forwards `SERVER_SESSION_PARSER` to the master.
-- A server that wants to observe matches only needs to read what it relays.
-
-### 4.5 Parser ids
-
-| Id | Name | Used for |
-|---|---|---|
-| 1–9 | `LAN_GENERATE` … `LAN_GAME_START` | loading and start handshake |
-| 10 | `LAN_GAME_SURRENDER` | a player surrenders |
-| 11 | `LAN_GAME_SURRENDER_CONFIRM` | |
-| 12 | `LAN_GAME_SERVER_LEAVE` | the host leaves |
-| 13 | `LAN_GAME_SESSION_RESULTS` | results (5.5) |
-| 14 | `LAN_GAME_SYNC_REQUEST` | a client lost sync |
-| 15 | `LAN_GAME_SYNC_DATA` | |
-| 16 | `LAN_GAME_SYNC_GAMETIME` | the host's game time |
-| 17 | `LAN_GAME_SYNC_ALIVE` | |
-| 100 | `LAN_ROOM_SERVER_DATASYNC` | the room state, from the master (5.3) |
-| 101 | `LAN_ROOM_SERVER_DATACHANGE` | |
-| 102 | `LAN_ROOM_CLIENT_DATACHANGE` | a client's nation / team / colour |
-| 103 | `LAN_ROOM_CLIENT_LEAVE` | |
-| 200–206 | `LAN_MODS_*` | mod sync and checksums |
-| 300 | `LAN_ADVISER_CLIENT_DATACHANGE` | |
+A **uid list** is `int32_t count; int32_t uid[count];`.
 
 ---
 
-## 5. Rooms
+## 4. Lobby frame
 
-### 5.1 Game name
+### 4.1 Frame construction
 
-`gamename` has three tab-separated, double-quoted fields:
+Every message, in both directions, is one frame:
+
+```
+Payload length ~~~ Message code ~~~ Sender id ~~~ Recipient id ~~~ Payload
+```
+
+```cpp
+struct frame_header      // 14 bytes, then the payload
+{
+    uint32_t length;     // payload bytes, not counting this header
+    uint16_t code;       // message code, 4.3
+    uint32_t id_from;    // sender's id; 0 = the server, or a client not yet logged in
+    uint32_t id_to;      // recipient's id; 0 = the server, or everyone in the room
+};
+```
+
+- There is no sync byte and no checksum; TCP keeps frames aligned.
+- A reader takes the 14-byte header, then exactly `length` bytes.
+
+> [!WARNING]
+> The protocol is not encrypted, and passwords are not hashed.
+> `SERVER_REGISTER`, `SERVER_AUTHENTICATE` and `SERVER_UPDATE_INFO` carry the
+> e-mail and the password in clear text. A server must not log their
+> payloads. Players should not reuse a password from elsewhere.
+
+### 4.2 Addresses
+
+| `id_from` / `id_to` | Meaning |
+|---|---|
+| `0` | the lobby server; as a recipient in a room: every other member |
+| `1` … | a player's lobby id, assigned at registration |
+
+The server fills `id_from` of `USER_*` messages with the id they concern.
+For example, the id of the player who connected in `USER_CONNECTED`.
+
+### 4.3 Message codes
+
+Directions:
+
+- **C→S** — client to server, a request (`SERVER_*` names);
+- **S→C** — server to client (`USER_*` names);
+- **C↔C** — relayed between room members (`LAN_*` names).
+
+| Code | Name | Dir | Purpose | Payload |
+|---|---|---|---|---|
+| `0x0032` | `LAN_PARSER` | C↔C | a parser inside a match | [5.4](#0x0032-lan_parser) |
+| `0x0064` | `LAN_CLIENT_INFO` | C↔C | a client's info (LAN mode) | [5.4](#0x0064-lan_client_info) |
+| `0x00C8` | `LAN_SERVER_INFO` | C↔C | the game's info (LAN mode) | [5.4](#0x00c8-lan_server_info) |
+| `0x0190` | `SHELL_CONSOLE` | | | — |
+| `0x0191` | `PING` | C→S, S→C | round trip time | [5.1](#0x0191-ping) |
+| `0x0192` | `SERVER_CLIENTINFO` | C→S | ask for a player's info | [5.1](#0x0192-server_clientinfo) |
+| `0x0193` | `USER_CLIENTINFO` | S→C | a player's info | [5.1](#0x0193-user_clientinfo) |
+| `0x0194` | `SERVER_SESSION_MSG` | C→S | room chat | [5.2](#0x0194-server_session_msg--0x0195-user_session_msg) |
+| `0x0195` | `USER_SESSION_MSG` | S→C | room chat | [5.2](#0x0194-server_session_msg--0x0195-user_session_msg) |
+| `0x0196` | `SERVER_MESSAGE` | C→S | private message | [5.2](#0x0196-server_message--0x0197-user_message) |
+| `0x0197` | `USER_MESSAGE` | S→C | private message | [5.2](#0x0196-server_message--0x0197-user_message) |
+| `0x0198` | `SERVER_REGISTER` | C→S | create an account and log in | [5.1](#0x0198-server_register) |
+| `0x0199` | `USER_REGISTER` | S→C | result, and the lobby | [5.1](#0x0199-user_register--0x019b-user_authenticate) |
+| `0x019A` | `SERVER_AUTHENTICATE` | C→S | log in | [5.1](#0x019a-server_authenticate) |
+| `0x019B` | `USER_AUTHENTICATE` | S→C | result, and the lobby | [5.1](#0x0199-user_register--0x019b-user_authenticate) |
+| `0x019C` | `SERVER_SESSION_CREATE` | C→S | create a room | [5.3](#0x019c-server_session_create) |
+| `0x019D` | `USER_SESSION_CREATE` | S→C | a room was created | [5.3](#0x019d-user_session_create) |
+| `0x019E` | `SERVER_SESSION_JOIN` | C→S | join a room | [5.3](#0x019e-server_session_join) |
+| `0x019F` | `USER_SESSION_JOIN` | S→C | a player joined | [5.3](#0x019f-user_session_join) |
+| `0x01A0` | `SERVER_SESSION_LEAVE` | C→S | leave the room | empty |
+| `0x01A1` | `USER_SESSION_LEAVE` | S→C | a player left | [5.3](#0x01a1-user_session_leave) |
+| `0x01A2` | `SERVER_SESSION_LOCK` | C→S | the master starts the match | [5.3](#0x01a2-server_session_lock) |
+| `0x01A3` | `USER_SESSION_LOCK` | S→C | a room started | [5.3](#0x01a3-user_session_lock) |
+| `0x01A4` | `SERVER_SESSION_INFO` | C→S | ask for the room | empty |
+| `0x01A5` | `USER_SESSION_INFO` | S→C | a room's info | [5.3](#0x01a5-user_session_info) |
+| `0x01A6` | `USER_CONNECTED` | S→C | a player came online | [5.1](#0x01a6-user_connected--0x01b4-user_update_info) |
+| `0x01A7` | `USER_DISCONNECTED` | S→C | a player went offline | empty; `id_from` = the player |
+| `0x01A8` | `SERVER_USER_EXIST` | C→S | is this e-mail registered? | [5.1](#0x01a8-server_user_exist) |
+| `0x01A9` | `USER_USER_EXIST` | S→C | answer | [5.1](#0x01a9-user_user_exist) |
+| `0x01AA` | `SERVER_SESSION_UPDATE` | C→S | the room's lobby entry changed | [5.3](#0x01aa-server_session_update) |
+| `0x01AB` | `SERVER_SESSION_CLIENT_UPDATE` | C→S | a player's lobby team | [5.3](#0x01ab-server_session_client_update--0x01ac-user_session_client_update) |
+| `0x01AC` | `USER_SESSION_CLIENT_UPDATE` | S→C | a player's lobby team | [5.3](#0x01ab-server_session_client_update--0x01ac-user_session_client_update) |
+| `0x01AD` | `SERVER_VERSION_INFO` | C→S | the client's data version | [5.1](#0x01ad-server_version_info) |
+| `0x01AE` | `USER_VERSION_INFO` | S→C | the server's versions and settings | [5.1](#0x01ae-user_version_info) |
+| `0x01AF` | `SERVER_SESSION_CLOSE` | C→S | the host ends the match | empty |
+| `0x01B0` | `USER_SESSION_CLOSE` | S→C | a room closed | [5.3](#0x01b0-user_session_close) |
+| `0x01B1` | `SERVER_GET_TOP_USERS` | C→S | ask for the top list | [5.1](#0x01b1-server_get_top_users) |
+| `0x01B2` | `USER_GET_TOP_USERS` | S→C | the top list | [5.1](#0x01b2-user_get_top_users) |
+| `0x01B3` | `SERVER_UPDATE_INFO` | C→S | change password / nickname / country | [5.1](#0x01b3-server_update_info) |
+| `0x01B4` | `USER_UPDATE_INFO` | S→C | a player's info changed | [5.1](#0x01a6-user_connected--0x01b4-user_update_info) |
+| `0x01B5` | `SERVER_SESSION_KICK` | C→S | the master kicks a player | [5.3](#0x01b5-server_session_kick--0x01b6-user_session_kick) |
+| `0x01B6` | `USER_SESSION_KICK` | S→C | a player was kicked | [5.3](#0x01b5-server_session_kick--0x01b6-user_session_kick) |
+| `0x01B7` | `SERVER_SESSION_CLSCORE` | C→S | the host reports a player's result | [5.3](#0x01b7-server_session_clscore--0x01b8-user_session_clscore) |
+| `0x01B8` | `USER_SESSION_CLSCORE` | S→C | | [5.3](#0x01b7-server_session_clscore--0x01b8-user_session_clscore) |
+| `0x01B9` | `SERVER_FORGOT_PSW` | C→S | password reminder | [5.1](#0x01b9-server_forgot_psw) |
+| `0x01BA` | `SERVER_SESSION_WRONG_CLOSE` | C→S | | — |
+| `0x01BB` | `SERVER_SESSION_PARSER` | C→S | a parser to a room member, or to the whole room | [5.3](#0x01bb-server_session_parser) |
+| `0x01BC` | `USER_SESSION_PARSER` | S→C | the same parser, delivered | [5.3](#0x01bc-user_session_parser) |
+| `0x01BD` | `USER_SESSION_RECREATE` | S→C | recreate the room after the host left | [5.3](#0x01bd-user_session_recreate) |
+| `0x01BE` | `USER_SESSION_REJOIN` | S→C | rejoin | empty |
+| `0x01BF` | `SERVER_PING_TEST` | | | — |
+| `0x01C0` | `USER_PING_TEST` | | | — |
+| `0x01C1` | `SERVER_SESSION_REJOIN` | C→S | | — |
+| `0x01C2`–`0x01C5` | `*_FRIENDS` | | friends | not documented |
+| `0x01C6`–`0x01CA` | `*_CHATS` | | chat channels | not documented |
+| `0x01CB`–`0x01CF` | `*_CLANS` | | clans | not documented |
+| `0x01D0`–`0x01D3` | `*_MEMBERS` | | clan members | not documented |
+| `0x01D4`–`0x01DB` | `*_ADMINS` | | moderation | not documented |
+| `0x01DC`–`0x01DF` | `*_STATS` | | statistics | not documented |
+| `0x01E0` | `SERVER_GET_SESSIONS` | C→S | ask for the room list | empty |
+| `0x01E1` | `USER_GET_SESSIONS` | S→C | the room list | [5.3](#0x01e1-user_get_sessions) |
+| `0x01E2` | `SERVER_PING_LOCK` | C→S | | empty |
+| `0x01E3` | `SERVER_PING_UNLOCK` | C→S | | empty |
+| `0x01E4` | `SERVER_CHECKSUM` | C→S | the client's checksum | [5.1](#0x01e4-server_checksum) |
+| `0x01E5` | `USER_CHECKSUM` | S→C | | empty |
+| `0x01E6` | `USER_CHECKSUM_FAILED` | S→C | | — |
+| `0x0456` | `LAN_DO_START` | C↔C | the master starts loading | [5.4](#0x0456-lan_do_start--0x0457-lan_do_start_game--0x0460-lan_do_ready--0x0461-lan_do_ready_done) |
+| `0x0457` | `LAN_DO_START_GAME` | C↔C | | [5.4](#0x0456-lan_do_start--0x0457-lan_do_start_game--0x0460-lan_do_ready--0x0461-lan_do_ready_done) |
+| `0x0460` | `LAN_DO_READY` | C↔C | a client has loaded | [5.4](#0x0456-lan_do_start--0x0457-lan_do_start_game--0x0460-lan_do_ready--0x0461-lan_do_ready_done) |
+| `0x0461` | `LAN_DO_READY_DONE` | C↔C | everyone has loaded | [5.4](#0x0456-lan_do_start--0x0457-lan_do_start_game--0x0460-lan_do_ready--0x0461-lan_do_ready_done) |
+| `0x04B0` | `LAN_RECORD` | C↔C | **the match stream** | [section 8](#8-the-match-stream-0x04b0-lan_record) |
+
+### 4.4 Flow of a match
+
+```mermaid
+sequenceDiagram
+    participant M as master / host
+    participant L as lobby server
+    participant P as another player
+    M->>L: 0x019C SERVER_SESSION_CREATE
+    L-->>P: 0x019D USER_SESSION_CREATE (the room appears in the list)
+    P->>L: 0x019E SERVER_SESSION_JOIN
+    L-->>M: 0x019F USER_SESSION_JOIN
+    loop in the room
+        M->>L: 0x01BB SERVER_SESSION_PARSER 100 (room datasync), 0x01AA SERVER_SESSION_UPDATE
+        L-->>P: 0x01BC USER_SESSION_PARSER 100
+        P->>L: 0x01BB SERVER_SESSION_PARSER 102 (my nation, team, colour)
+    end
+    M->>L: 0x01A2 SERVER_SESSION_LOCK
+    M->>L: 0x0456 LAN_DO_START, parsers 1-9 while loading
+    P->>L: 0x0460 LAN_DO_READY
+    loop the match
+        M->>L: 0x04B0 LAN_RECORD (records, sync blocks)
+        M->>L: 0x0032 LAN_PARSER 16 (game time, every 5 s)
+        P->>L: 0x04B0 LAN_RECORD (requests)
+    end
+    M->>L: 0x0032 LAN_PARSER 13 (results)
+    M->>L: 0x01B7 SERVER_SESSION_CLSCORE (per player)
+    M->>L: 0x01AF SERVER_SESSION_CLOSE
+    L-->>P: 0x01B0 USER_SESSION_CLOSE
+```
+
+---
+
+## 5. Lobby messages
+
+### 5.1 Connection and accounts
+
+#### 0x0191 PING
+
+```cpp
+// C→S (id_from != 0)
+datetime_t pingtime;          // the client's clock
+
+// S→C (id_from == 0)
+uint32_t count;
+struct { uint32_t id; datetime_t pingtime; } clients[count];
+```
+
+#### 0x0192 SERVER_CLIENTINFO
+
+```cpp
+uint32_t id;                  // whose info
+```
+
+#### 0x0193 USER_CLIENTINFO
+
+```cpp
+uint32_t   id;
+uint8_t    states;            // 5.5.1
+str8_t     nickname;
+str8_t     country;
+uint32_t   score;
+uint32_t   games_played;
+uint32_t   games_win;
+datetime_t last_game;
+str8_t     info;              // free-form text the client registered with
+datetime_t pingtime;          // data version 2.1.0 and later
+```
+
+#### 0x0198 SERVER_REGISTER
+
+```cpp
+version_t vcore;              // "1.0.0.7"
+version_t vdata;              // "2.2.3"
+str8_t    email;
+str8_t    password;           // clear text!
+str8_t    cdkey;
+str8_t    nickname;
+str8_t    country;
+str8_t    info;
+```
+
+#### 0x019A SERVER_AUTHENTICATE
+
+```cpp
+version_t vcore;
+version_t vdata;
+str8_t    email;
+str8_t    password;           // clear text!
+str8_t    cdkey;
+```
+
+#### 0x0199 USER_REGISTER / 0x019B USER_AUTHENTICATE
+
+```cpp
+uint8_t error;                // 5.5.2; 0 = logged in, and the rest follows
+str8_t     nickname;
+str8_t     country;
+uint32_t   score;
+uint32_t   games_played;
+uint32_t   games_win;
+datetime_t last_game;
+str8_t     info;
+
+// the players online, until an id of 0
+struct {
+    uint32_t   id;            // 0 ends the list
+    uint8_t    states;
+    str8_t     nickname;
+    str8_t     country;
+    str8_t     info;
+    uint32_t   score;         // this and the rest: data version 2.1.0 and later
+    uint32_t   games_played;
+    uint32_t   games_win;
+    datetime_t last_game;
+    datetime_t pingtime;
+} clients[];
+
+// the rooms, until a master id of 0
+struct {
+    uint32_t master_id;       // 0 ends the list
+    uint32_t max_players;
+    str8_t   gamename;        // 7.1
+    str8_t   mapname;         // 7.2
+    uint32_t money;
+    bool8_t  fog_of_war;
+    uint8_t  battlefield;
+    uint32_t count;
+    uint32_t id[count];       // the players in it
+} sessions[];
+```
+
+#### 0x01A6 USER_CONNECTED / 0x01B4 USER_UPDATE_INFO
+
+`id_from` is the player.
+
+```cpp
+str8_t     nickname;
+str8_t     country;
+str8_t     info;
+uint8_t    states;
+uint32_t   score;             // this and the rest: data version 2.1.0 and later
+uint32_t   games_played;
+uint32_t   games_win;
+datetime_t last_game;
+datetime_t pingtime;
+```
+
+#### 0x01A8 SERVER_USER_EXIST
+
+```cpp
+str8_t email;
+```
+
+#### 0x01A9 USER_USER_EXIST
+
+```cpp
+str8_t  email;
+bool8_t exist;
+```
+
+#### 0x01AD SERVER_VERSION_INFO
+
+```cpp
+version_t vdata;
+```
+
+#### 0x01AE USER_VERSION_INFO
+
+```cpp
+version_t      vcore;
+version_t      vdata;
+sized_parser_t parser;        // Sich sends an empty one
+```
+
+#### 0x01B1 SERVER_GET_TOP_USERS
+
+```cpp
+uint32_t count;               // how many
+```
+
+#### 0x01B2 USER_GET_TOP_USERS
+
+```cpp
+struct {
+    uint8_t    mark;          // 0 ends the list; 2 = the id follows (data 1.3.6 and later)
+    str8_t     nickname;
+    str8_t     country;
+    uint32_t   score;
+    uint32_t   games_played;
+    uint32_t   games_win;
+    datetime_t last_game;
+    uint32_t   id;            // if mark >= 2
+} users[];
+```
+
+#### 0x01B3 SERVER_UPDATE_INFO
+
+```cpp
+str8_t password;              // the new password, clear text
+str8_t nickname;
+str8_t country;
+str8_t info;
+```
+
+#### 0x01B9 SERVER_FORGOT_PSW
+
+```cpp
+str8_t email;
+```
+
+#### 0x01E4 SERVER_CHECKSUM
+
+```cpp
+str16_t checksum;
+```
+
+### 5.2 Chat
+
+#### 0x0194 SERVER_SESSION_MSG / 0x0195 USER_SESSION_MSG
+
+Room chat: to everyone in the room. It is also used in the match.
+
+```cpp
+str8_t message;
+```
+
+#### 0x0196 SERVER_MESSAGE / 0x0197 USER_MESSAGE
+
+A private message to `id_to`.
+
+```cpp
+str8_t message;
+```
+
+### 5.3 Rooms
+
+#### 0x019C SERVER_SESSION_CREATE
+
+```cpp
+uint32_t max_players;
+str8_t   password;            // "" = open
+str8_t   gamename;            // 7.1
+str8_t   mapname;             // 7.2; "0" at creation
+uint32_t money;
+bool8_t  fog_of_war;
+uint8_t  battlefield;
+```
+
+#### 0x019D USER_SESSION_CREATE
+
+`id_from` is the master.
+
+```cpp
+uint8_t  states;
+uint32_t max_players;
+str8_t   gamename;
+str8_t   mapname;
+uint32_t money;
+bool8_t  fog_of_war;
+uint8_t  battlefield;
+```
+
+#### 0x019E SERVER_SESSION_JOIN
+
+```cpp
+uint32_t master_id;           // the room to join
+```
+
+#### 0x019F USER_SESSION_JOIN
+
+```cpp
+uint32_t master_id;
+uint8_t  states;              // of the player who joined (id_from)
+```
+
+#### 0x01A1 USER_SESSION_LEAVE
+
+`id_from` is the player who left.
+
+```cpp
+bool8_t  is_master;           // the master left
+uint32_t count;
+struct { uint32_t id; uint8_t states; } clients[count];   // is_master: every member; else the one who left
+```
+
+When the master leaves a started room, the server picks a new master and
+sends it `USER_SESSION_RECREATE`.
+
+#### 0x01A2 SERVER_SESSION_LOCK
+
+The master starts the match.
+
+```cpp
+uint32_t count;
+struct {
+    uint32_t id;
+    uint8_t  team;            // the lobby team: a placeholder in regular rooms (7.3)
+} clients[count];
+```
+
+#### 0x01A3 USER_SESSION_LOCK
+
+```cpp
+uint32_t count;
+struct {
+    uint32_t id;              // if 0: a session_id follows instead of states
+    uint8_t  states;          // if id != 0
+    uint32_t session_id;      // if id == 0
+} entries[count];
+```
+
+#### 0x01A5 USER_SESSION_INFO
+
+```cpp
+uint32_t max_players;
+str8_t   gamename;
+str8_t   mapname;
+uint32_t money;
+bool8_t  fog_of_war;
+uint8_t  battlefield;
+uint32_t count;
+struct { uint32_t id; uint8_t states; } clients[count];
+```
+
+#### 0x01AA SERVER_SESSION_UPDATE
+
+The master updates its room's lobby entry, whenever the room changes.
+
+```cpp
+str8_t   gamename;            // 7.1
+str8_t   mapname;             // 7.2: the room's status, not a map
+uint32_t money;
+bool8_t  fog_of_war;
+uint8_t  battlefield;
+```
+
+#### 0x01AB SERVER_SESSION_CLIENT_UPDATE / 0x01AC USER_SESSION_CLIENT_UPDATE
+
+```cpp
+uint8_t team;                 // the lobby team (7.3)
+```
+
+#### 0x01B0 USER_SESSION_CLOSE
+
+```cpp
+datetime_t timestamp;
+uint32_t   count;
+struct { uint32_t id; uint32_t score; } clients[count];
+```
+
+#### 0x01B5 SERVER_SESSION_KICK / 0x01B6 USER_SESSION_KICK
+
+```cpp
+uint32_t id;
+```
+
+#### 0x01B7 SERVER_SESSION_CLSCORE / 0x01B8 USER_SESSION_CLSCORE
+
+The host, at the end of a match. There is one per human.
+
+```cpp
+uint32_t id;
+int32_t  score;               // a result code, not points: 7.4
+```
+
+#### 0x01BB SERVER_SESSION_PARSER
+
+A parser to one room member (`id_to`), or to the whole room (`id_to` = 0).
+The server delivers it as `USER_SESSION_PARSER` with the same ids. The
+master sends the room datasync (parser 100) this way.
+
+```cpp
+uint32_t parser_id;           // 6.2
+parser_t parser;
+```
+
+#### 0x01BC USER_SESSION_PARSER
+
+```cpp
+uint32_t parser_id;
+parser_t parser;
+uint32_t unknown;             // Sich sends 0
+```
+
+#### 0x01BD USER_SESSION_RECREATE
+
+When the master leaves, the server sends this to the new master (the others
+get `USER_SESSION_REJOIN`):
+
+```cpp
+sized_parser_t parser;
+```
+
+```
+(root)
+├ gamename   = <game name>
+├ mapname    = <lobby status>
+├ master     = <new master's id>
+├ session    = <session id>
+├ clients    = <number of players>
+└ clientlist
+   ├ * = <id>
+   └ * = ...
+```
+
+#### 0x01E1 USER_GET_SESSIONS
+
+```cpp
+struct { /* as in USER_AUTHENTICATE */ } sessions[];   // until a master id of 0
+```
+
+### 5.4 In-room game messages
+
+The server relays these between the room members without reading them.
+
+#### 0x0032 LAN_PARSER
+
+A parser inside a match: section 6.
+
+```cpp
+uint32_t parser_id;
+parser_t parser;
+```
+
+#### 0x0064 LAN_CLIENT_INFO
+
+```cpp
+str16_t  player;
+str16_t  nickname;
+bool8_t  spectator;
+uint32_t id;
+uint8_t  team;
+uint32_t score;
+uint8_t  unknown1;
+uint8_t  unknown2;
+```
+
+#### 0x00C8 LAN_SERVER_INFO
+
+```cpp
+str16_t  gamename;
+str16_t  mapname;
+uint32_t max_players;
+uint32_t protocol_version;
+str16_t  host;
+bool8_t  secured;
+uint8_t  battlefield;
+bool8_t  fog_of_war;
+uint32_t money;
+```
+
+#### 0x0456 LAN_DO_START / 0x0457 LAN_DO_START_GAME / 0x0460 LAN_DO_READY / 0x0461 LAN_DO_READY_DONE
+
+The loading handshake. Their payloads carry nothing a match observer needs.
+
+#### 0x04B0 LAN_RECORD
+
+The match stream: [section 8](#8-the-match-stream-0x04b0-lan_record).
+
+### 5.5 Enumerations
+
+#### 5.5.1 Client states
+
+`states` is a bit field:
+
+| Bit | Mask | State |
+|---|---|---|
+| 0 | `0x01` | online |
+| 1 | `0x02` | in a room |
+| 2 | `0x04` | room master |
+| 3 | `0x08` | playing (the room has started) |
+
+#### 5.5.2 Login errors
+
+| Code | Meaning |
+|---|---|
+| 0 | OK |
+| 1 | e-mail already registered (register) / wrong password or unknown e-mail (login) |
+| 2 | account blocked / already logged in |
+| 3 | invalid game key |
+| 4 | the core version is outdated |
+| 5 | the data version is outdated |
+| 6 | invalid registration data |
+
+---
+
+## 6. Parsers
+
+The game's scripts talk to each other in rooms with **parsers**: key/value
+trees, sent as `LAN_PARSER` (`0x0032`) or `SERVER_SESSION_PARSER`
+(`0x01BB`). In the recorded matches, the room datasync (100) came as
+`SERVER_SESSION_PARSER` and the results (13) as `LAN_PARSER`.
+
+### 6.1 Tree encoding
+
+```
+Key ~~~ Value ~~~ Child count ~~~ Children
+```
+
+```cpp
+struct parser_node
+{
+    str32_t  key;
+    str32_t  value;              // numbers are decimal text
+    uint32_t count;
+    struct parser_node children[count];
+};
+```
+
+The root's key may name the tree (the datasync's root is `tmp`, with value
+`"\0"`). An empty payload is an empty tree.
+
+### 6.2 Parser ids
+
+| Id | Name | Sent by | Carries |
+|---|---|---|---|
+| 1 | `LAN_GENERATE` | | map generation |
+| 2 | `LAN_READYSTART` | | |
+| 3 | `LAN_START` | | |
+| 4 | `LAN_ROOM_READY` | | |
+| 5 | `LAN_ROOM_START` | | |
+| 6 | `LAN_ROOM_CLIENT_CHANGES` | | |
+| 7 | `LAN_GAME_READY` | | |
+| 8 | `LAN_GAME_ANSWER_READY` | | |
+| 9 | `LAN_GAME_START` | | |
+| 10 | `LAN_GAME_SURRENDER` | the player | empty: this player surrenders |
+| 11 | `LAN_GAME_SURRENDER_CONFIRM` | | |
+| 12 | `LAN_GAME_SERVER_LEAVE` | host | empty: the host leaves |
+| 13 | `LAN_GAME_SESSION_RESULTS` | host | results: [6.3.2](#632-13-lan_game_session_results) |
+| 14 | `LAN_GAME_SYNC_REQUEST` | client | the client lost sync |
+| 15 | `LAN_GAME_SYNC_DATA` | | |
+| 16 | `LAN_GAME_SYNC_GAMETIME` | host | the game clock: [6.3.3](#633-16-lan_game_sync_gametime) |
+| 17 | `LAN_GAME_SYNC_ALIVE` | | |
+| 100 | `LAN_ROOM_SERVER_DATASYNC` | master | the whole room: [6.3.1](#631-100-lan_room_server_datasync) |
+| 101 | `LAN_ROOM_SERVER_DATACHANGE` | master | |
+| 102 | `LAN_ROOM_CLIENT_DATACHANGE` | client | its choices: [6.3.4](#634-102-lan_room_client_datachange) |
+| 103 | `LAN_ROOM_CLIENT_LEAVE` | | |
+| 200 | `LAN_MODS_MODSYNC_REQUEST` | | mod download |
+| 201 | `LAN_MODS_MODSYNC_PARSER` | | |
+| 202–206 | `LAN_MODS_CHECKSUM_*` | | mod checksums |
+| 300 | `LAN_ADVISER_CLIENT_DATACHANGE` | | |
+
+### 6.3 Parser definitions
+
+#### 6.3.1 100 LAN_ROOM_SERVER_DATASYNC
+
+The master's copy of the room, sent to the whole room at every change as
+`SERVER_SESSION_PARSER`. One key under the root:
+
+| Key | Value |
+|---|---|
+| `s` | the room string below |
+
+```
+Slot 0 | … | Slot 11 | Season | Terrain | Relief | Start resources | Mines | Map size | 12 additional settings | Battle | Stage
+```
+
+Fields are separated by `|` (`gc_gui_delimiterchar` = 124).
+
+**The 12 slots** are `gMap.players` in order. The position is the slot
+number used everywhere else:
+
+| Slot text | Meaning |
+|---|---|
+| `id,cid,team,color,ready` | a player: lobby id, nation (11.1; 24 and more = random), team (0 = none), colour, ready flag |
+| `-difficulty,cid,team,color` | a computer: 4 fields, the first is 0 or negative: difficulty (11.5) |
+| `x` | a closed slot |
+| `0` | an empty slot |
+
+Spectators hold a slot with nation −2.
+
+**Map generator** (`gMap.settings.gen`):
+
+| # | Field | Values |
+|---|---|---|
+| 13 | season | 0 summer, 1 winter, 2 desert |
+| 14 | terrain | 0 land, 1 mediterranean, 2 peninsulas, 3 islands, 4 continents, 5 continent, 6 lakes, 7 coast, 8 rivers, 9 no water |
+| 15 | relief | 0 plain, 1 hills, 2 mountains, 3 highlands, 4 plateau, 5 desert |
+| 16 | starting resources | 0 normal, 1 rich, 2 thousands, 3 millions |
+| 17 | mines | 0 few, 1 medium, 2 many |
+| 18 | map size | 3 small, 0 normal, 1 large (2×), 2 huge (4×) |
+
+**Additional settings** (`gMap.settings.additional`):
+
+| # | Field | Values |
+|---|---|---|
+| 19 | starting units | 0 default, 1 army, 2 large army, 3 huge army, 4 many peasants, 5 different nations, 6 towers, 7 cannons, 8 cannons and howitzers, 9 18th c. barracks, 10 17th c. barracks, 11 village, 12 log cabins, 13 union |
+| 20 | balloons | 0 default, 1 none, 2 with balloons |
+| 21 | cannons | 0 default, 1 no cannons, towers and walls, 2 expensive cannons |
+| 22 | peace time | 0 none, 1 10 min, 11 15 min, 2 20 min, 3 30 min, 4 45 min, 5 60 min, 6 90 min, 7 2 h, 8 3 h, 9 4 h |
+| 23 | 18th century | 0 default, 1 never, 2 from the start |
+| 24 | capture | 0 default, 1 no peasants, 2 no peasants and centres, 3 cannons only |
+| 25 | market and diplomacy | 0 default, 1 no diplomatic centre, 2 no market, 3 neither, 4 expensive mercenaries |
+| 26 | allies | 0 default, 1 side by side |
+| 27 | autosave | |
+| 28 | population limit | 0 none; 1–8: 500, 750, 1000, 1500, 2200, 3000, 5000, 8000 units |
+| 29 | game speed | 0 normal, 1 fast, 2 very fast, −1 adjustable |
+| 30 | adviser | 0 default, 1 none |
+
+The last two fields:
+
+- **31 battle:** the historical battle's index; −1 on a random map.
+- **32 stage:** the battle's stage.
+
+Example (a 2.2.3 match: one player of England in slot 0 against a computer
+in slot 1):
+
+```
+1,2,0,0,0|0,24,0,1|0|0|0|0|0|0|x|x|x|0|0|0|3|2|1|0|0|0|0|0|0|0|0|1|0|0|2|1|-1|0
+```
+
+The fields read as follows:
+
+- **slot 0:** id 1, England, no team, colour 0;
+- **slot 1:** a normal computer with a random nation, colour 1;
+- **slots 8–10:** closed;
+- **map:** summer, land, highlands, "thousands" of starting resources,
+  medium mines, normal size;
+- **settings:** allies side by side, very fast speed, no adviser.
+
+#### 6.3.2 13 LAN_GAME_SESSION_RESULTS
+
+Sent by the host when a player's victory state changes, and at the end.
+There is one child per participant:
+
+```
+(root)
+├── * ── id = <lobby id>     0 for a computer player
+│      ├ ind = <slot>
+│      └ res = <state>      1 win, 2 lose (gc_player_victorystate_*; 0 none)
+└── * ── ...
+```
+
+A player can lose before the match ends, in a team game.
+
+#### 6.3.3 16 LAN_GAME_SYNC_GAMETIME
+
+The host's game clock, as `LAN_PARSER`. It is sent every 5 s of real time
+while the room has more than one human, and when the host changes the game
+speed.
+
+| Key | Value |
+|---|---|
+| `t` | game time, seconds (decimal text) |
+| `s` | the time speed factor |
+
+> [!NOTE]
+> In a match against computer players only, there is no parser 16. Use the
+> arrival time of the stream then (8.1).
+
+#### 6.3.4 102 LAN_ROOM_CLIENT_DATACHANGE
+
+A client tells the master its own choices:
+
+| Key | Value |
+|---|---|
+| `s` | `cid|team|color` |
+
+---
+
+## 7. Room data
+
+### 7.1 Game name
 
 ```
 "<room name>"<TAB>"<password>"<TAB><kind><checksum>
@@ -283,581 +984,785 @@ The codes a match uses. Sich names every code of the protocol.
 | Part | Meaning |
 |---|---|
 | kind | `0` a regular room, `r` a rating (quick play) room, `h` a historical battle |
-| checksum | 4 hex digits of the MD5 of the game's script library: `3EEB` for the unmodded 2.2.3 scripts. Another value means a room with script mods. |
+| checksum | 4 hex digits of the MD5 of the game's script library. `3EEB` = unmodded 2.2.3 scripts; another value = a room with script mods. |
 
-### 5.2 Lobby status ("map name")
+### 7.2 Lobby status
 
-The `mapname` field of the session messages is **not a map**. The master
-fills it with the room's status for the lobby list:
-
-```
-<flags>|<humans>|<computers>|<closed slots>|<ping>|<rank>[|<id 1>|<id 2>|<search time>|<quick play state>]
-```
-
-- `flags`: bit 0 set means the room exists; bit 1 full; bit 2 locked.
-- The last four fields appear in quick-play rooms only.
-- Example: `1|1|1|3|0|0` is one human, one computer and three closed slots.
-
-It is `0` right after the room is created. The map itself is in the
-datasync.
-
-### 5.3 Room datasync (parser 100)
-
-The master sends the whole room as one string. It is the value of the key
-`s` under the tree root:
+The `mapname` field of the room messages is **not a map**. The master fills
+it with the room's status for the lobby list:
 
 ```
-<slot 0>|<slot 1>|...|<slot 11>|<season>|<terrain>|<relief>|<start resources>|<mines>|<map size>|<12 additional settings>|<battle>|<stage>
+flags | humans | computers | closed slots | ping | rank [ | id 1 | id 2 | search time | quick play state ]
 ```
 
-**Slots** are the room's 12 player places (`gMap.players`, in order: this is
-the *slot* number used everywhere else):
-
-| Form | Meaning |
+| Field | Meaning |
 |---|---|
-| `id,cid,team,color,ready` | a player: lobby id, nation (9.1; 24 and more: random), team (0 = none), colour, ready flag |
-| `-difficulty,cid,team,color` | a computer: difficulty 0 normal, 1 hard, 2 very hard, 3 impossible (4 fields, first ≤ 0) |
-| `x` | a closed slot |
-| `0` | an empty slot |
+| flags | bit 0 = the room exists, bit 1 = full, bit 2 = locked |
+| humans / computers / closed | counts of slots |
+| ping, rank | |
+| the last four | quick-play rooms only |
 
-Spectators take a slot with nation `-2`.
+`1|1|1|3|0|0` is one human, one computer and three closed slots. It is `0`
+right after the room is created. The map is in the datasync (6.3.1).
 
-**Map generator:**
+### 7.3 Teams
 
-| # | Setting | Values |
-|---|---|---|
-| 1 | season | 0 summer, 1 winter, 2 desert |
-| 2 | terrain | 0 land, 1 mediterranean, 2 peninsulas, 3 islands, 4 continents, 5 continent, 6 lakes, 7 coast, 8 rivers, 9 no water |
-| 3 | relief | 0 plain, 1 hills, 2 mountains, 3 highlands, 4 plateau, 5 desert |
-| 4 | starting resources | 0 normal, 1 rich, 2 thousands, 3 millions |
-| 5 | mines | 0 few, 1 medium, 2 many |
-| 6 | map size | 3 small, 0 normal, 1 large (2×), 2 huge (4×) |
-
-**Additional settings** (`gMap.settings.additional`):
-
-| # | Setting | Values |
-|---|---|---|
-| 1 | starting units | 0 default, 1 army, 2 large army, 3 huge army, 4 many peasants, 5 different nations, 6 towers, 7 cannons, 8 cannons and howitzers, 9 18th c. barracks, 10 17th c. barracks, 11 village, 12 log cabins, 13 union |
-| 2 | balloons | 0 default, 1 none, 2 with balloons |
-| 3 | cannons | 0 default, 1 no cannons, towers and walls, 2 expensive cannons |
-| 4 | peace time | 0 none, 1 10 min, 11 15 min, 2 20 min, 3 30, 4 45, 5 60, 6 90 min, 7 2 h, 8 3 h, 9 4 h |
-| 5 | 18th century | 0 default, 1 never, 2 from the start |
-| 6 | capture | 0 default, 1 no peasants, 2 no peasants and centres, 3 cannons only |
-| 7 | market and diplomacy | 0 default, 1 no diplomatic centre, 2 no market, 3 neither, 4 expensive mercenaries |
-| 8 | allies | 0 default, 1 side by side |
-| 9 | autosave | |
-| 10 | population limit | 0 none, 1–8: 500, 750, 1000, 1500, 2200, 3000, 5000, 8000 |
-| 11 | game speed | 0 normal, 1 fast, 2 very fast, -1 adjustable |
-| 12 | adviser | 0 default, 1 none |
-
-**Battle:** the historical battle's index, or -1 on a random map. **Stage:**
-the battle's stage.
-
-### 5.4 Teams
-
-- `SERVER_SESSION_LOCK` and `SERVER_SESSION_CLIENT_UPDATE` carry a *lobby
-  team*. In regular rooms it is a placeholder: the creator sets
-  `gc_MaxPlayerCount + 1` (13), and the others 0.
+- `SERVER_SESSION_LOCK` and `SERVER_SESSION_CLIENT_UPDATE` carry a **lobby
+  team**. In regular rooms it is a placeholder: the creator sets
+  `gc_MaxPlayerCount + 1` = 13, and the others 0.
 - In rating rooms it is the matchmaking side.
-- The team a player picked in the room is in the datasync (5.3); there, 0
-  means no team.
+- The team a player picked in the room is in the datasync (6.3.1); there,
+  0 means no team.
 
-### 5.5 Results (parser 13)
+### 7.4 Result codes
 
-The host sends one child per participant:
-
-| Key | Value |
-|---|---|
-| `id` | lobby id; **0 for a computer player** |
-| `ind` | the slot |
-| `res` | 1 win, 2 lose (`gc_player_victorystate_*`; 0 none) |
-
-When a player's state changes, the host may send parser 13 again. In a team
-game, a player can lose before the match ends.
-
-### 5.6 `SERVER_SESSION_CLSCORE`
-
-A **result code**, not points. The host sends it at the end of a match that
-is a rating match or lasted over 10 minutes of game time, one per human
-(`_misc_LanCloseSessionSetScores`):
+`SERVER_SESSION_CLSCORE.score` (`_misc_LanCloseSessionSetScores`). The host
+sends it only for a rating match, or a match longer than 10 minutes of game
+time:
 
 | Room | Winner | Loser |
 |---|---|---|
-| rating | +1 (−1 if they were the first to leave) | −1 |
-| regular | +2 (−2 if they were the first to leave) | not sent |
+| rating | +1; −1 if they left first | −1 |
+| regular | +2; −2 if they left first | not sent |
 
 ---
 
-## 6. The match stream
+## 8. The match stream (`0x04B0 LAN_RECORD`)
 
-### 6.1 Who sends what
+### 8.1 Block construction
 
-- **The host** broadcasts `LAN_RECORD` frames with records and sync blocks.
-  Only the host sends sync blocks and progress-machine records: that tells
-  an observer who the host is.
-- **Clients** send the records of their own actions to the host (owner =
-  their slot; `server` field false where there is one). These are requests;
-  the host's broadcast that follows is what happened. *(From the game's
-  scripts; the recorded matches this revision was checked on were against
-  computer players, where only the host sends records.)*
-- The stream carries **no game clock**. Use the arrival time, and take the
-  first `LAN_RECORD` of the match as game time 0 (the map has loaded).
+A `LAN_RECORD` payload is a sequence of **blocks**, with no count or length
+in front. The first byte of a block — its **signature** — tells its type:
 
-### 6.2 Payload
-
-A `LAN_RECORD` payload is a sequence of blocks with no count or length in
-front. The first byte of a block tells its type:
-
-| First byte | Block |
+| Signature | Block |
 |---|---|
-| `0x00` | record (6.3) |
-| `0x09` | sync block (6.7) |
+| `0x00 0x03` | record |
+| `0x09` | sync block |
 
-### 6.3 Record block
+**Record:**
 
-| Offset | Size | Field |
+```
+0x00 ~~~ 0x03 ~~~ Owner ~~~ Section ~~~ Body ~~~ 0x01
+```
+
+```cpp
+struct record
+{
+    uint8_t  signature;       // 0x00
+    uint8_t  kind;            // 0x03 (always, in 2.2.3)
+    uint8_t  owner;           // the machine: 8.2
+    uint16_t section;         // index of the Read* section in the owner's .aix: 8.3
+    uint8_t  body[];          // what the matching Write* section wrote: 8.5, 8.6
+    uint8_t  end;             // 0x01
+};
+```
+
+**Sync block:**
+
+```
+0x09 ~~~ Key ~~~ Count ~~~ Entries
+```
+
+```cpp
+struct sync_block
+{
+    uint8_t  signature;       // 0x09
+    uint24_t key;             // unknown; changes from block to block and wraps
+    uint32_t count;
+    struct sync_entry entries[count];   // 8.7
+};
+```
+
+> [!WARNING]
+> A record's body has no length. To find where the next block starts, a
+> reader must know the section's layout. `0x01` may also appear inside a
+> body: check it only at the end of a decoded body. See 8.8 for records
+> without a known layout.
+
+**Who sends:**
+
+- **The host** broadcasts records and sync blocks. Only the host sends sync
+  blocks and progress records: that tells an observer who the host is.
+- **A client** sends the records of its own actions to the host (owner =
+  its slot, `server` field 0). The host's broadcast that follows is what
+  happened.
+- **Time:** the stream has no timestamp. Take the first `LAN_RECORD` of the
+  match as game time 0 (the map has loaded). In matches with more than one
+  human, parser 16 (6.3.3) gives the host's game time every 5 s.
+
+### 8.2 Owners
+
+| Owner | Name | Machine |
 |---|---|---|
-| 0 | 1 | `0x00` |
-| 1 | 1 | `0x03` (always, in version 2.2.3) |
-| 2 | 1 | **owner**: the machine the record runs in |
-| 3 | 2 | **section**: `u16`, the index of the `Read*` section in that machine's `.aix` file |
-| 5 | n | body: what the matching `Write*` section wrote (6.5) |
-| 5 + n | 1 | `0x01`: end of record |
+| `0x00`–`0x0B` | player slot 0–11 | `data/scripts/units/global.aix` |
+| `0x0C` | `gc_playerind_env` | the environment: fields, trees (appears in bodies) |
+| `0x0D` | `gc_playerind_misc` | |
+| `0x0E` | `gc_playerind_progress` | `data/scripts/progress/progress.aix` |
+| `0x0F` | `gc_playerind_pool` | |
 
-**Owner:**
+### 8.3 Record types
 
-| Owner | Machine |
-|---|---|
-| 0–11 | the player in that slot: `data/scripts/units/global.aix` |
-| 12 | `gc_playerind_env`: the environment (fields, trees; seen as a *field* in bodies) |
-| 13 | `gc_playerind_misc` |
-| 14 (`0x0E`) | `gc_playerind_progress`: `data/scripts/progress/progress.aix` |
-| 15 | `gc_playerind_pool` |
+A machine's sections are numbered in `.aix` file order, separators
+included. Only `Read*` sections appear in records.
 
-The body has **no length**. To find the next block you must know the
-section's layout; 6.8 describes how to recover when you do not.
+**Progress machine** (owner `0x0E`):
 
-### 6.4 Section indexes
-
-A machine's sections are numbered in the order of the `.aix` file,
-separators included. Only the `Read*` sections appear in records.
-
-**`global.aix`** (players):
-
-| Index | Section | Index | Section |
+| Section | Name | Carries | Layout |
 |---|---|---|---|
-| 6 | `ReadSquadNew` | 39 | `ReadLeave` |
-| 8 | `ReadSquadListAction` | 41 | `ReadProj` |
-| 11 | `ReadMove` | 43 | `ReadProjFree` |
-| 13 | `ReadNew` | 45 | `ReadNewP` |
-| 15 | `ReadFree` | 47 | `ReadStop` |
-| 17 | `ReadDeath` | 49 | `ReadTrade` |
-| 19 | `ReadPlayer` | 51 | `ReadWall` |
-| 21 | `ReadRally` | 53 | `ReadGate` |
-| 23 | `ReadOrder` | 55 | `ReadFreeList` |
-| 25 | `ReadUpgrade` | 57 | `ReadPeaceTime` |
-| 27 | `ReadProduce` | 59 | `ReadSync` |
-| 29 | `ReadSearch` | 61 | `ReadSyncUnitsParams` |
-| 31 | `ReadStand` | 64 | `ReadPackage` |
-| 33 | `ReadConstruct` | 70 | `ReadTradeResources` |
-| 35 | `ReadApply` | | |
-| 37 | `ReadLeaveOrder` | | |
+| `0x08` | `ReadRes` | resources on hand; frequent, only what changed | [8.5.1](#0x08-readres) |
+| `0x0A` | `ReadStats` | the game's statistics; about every 20 s, and at the end | [8.5.2](#0x0a-readstats) |
+| `0x0C` | `ReadScenario` | scenario state | not documented |
+| `0x0F` | `ReadLanSyncData` | workers, squads | [8.5.3](#0x0f-readlansyncdata) |
 
-**`progress.aix`**:
+Only the host sends progress records.
 
-| Index | Section |
-|---|---|
-| 8 | `ReadRes` |
-| 10 | `ReadStats` |
-| 12 | `ReadScenario` |
-| 15 | `ReadLanSyncData` |
+**Player machines** (owner = slot):
 
-### 6.5 Record layouts
-
-Types are those of 3.2. `uids` fields are an `Integer` count followed by
-that many `Integer` uids.
-
-A leading `server` Boolean is true when the host wrote the record, and false
-in a client's request.
-
-#### 6.5.1 `ReadRes` (progress 8) — resources on hand
-
-| Type | Field |
-|---|---|
-| `Word` | mask of players present (bit = slot) |
-| per player in the mask: | |
-| `Byte` | `changed`: bit *r* set if resource *r* changed (9.2) |
-| `Byte` | `compressed`: bit *r* set if the change is sent as one byte |
-| per resource in `changed`: | `Byte` change if `compressed`, else `Integer` new amount |
-
-- The game keeps amounts **bit-inverted** (`setres = not amount`). An
-  `Integer` value *v* is the amount `~v`.
-- A one-byte change *b* is `+b` for *b* < 128 and `−(b − 128)` otherwise:
-  new amount = old amount + change.
-- Sent frequently, and only for what changed.
-
-#### 6.5.2 `ReadStats` (progress 10) — the game's statistics
-
-| Type | Field |
-|---|---|
-| `Integer` | `mask1` |
-| `Integer` | `mask2` |
-| per player with bit *slot* in `mask1`, per group, per resource *r* = 1…6 whose bit is set: | `Integer` running total |
-
-The groups and their bits (P = 12, the player bits of `mask1`):
-
-| Group | Mask | Bit of resource *r* | Game variable |
+| Section | Name | Carries | Layout |
 |---|---|---|---|
-| total | `mask1` | P + *r* | `stat.restotal`: gathered |
-| upgrades | `mask1` | P + 6 + *r* | `stat.resonupgrade`: spent on upgrades |
-| mines | `mask1` | P + 12 + *r* | `stat.resonmines`: spent on mine upgrades and workers |
-| units | `mask2` | *r* | `stat.resonunits`: spent on units (7.4!) |
-| buildings | `mask2` | 6 + *r* | `stat.resonbuildings` |
+| `0x06` | `ReadSquadNew` | a formation is made | [8.6.1](#0x06-readsquadnew) |
+| `0x08` | `ReadSquadListAction` | an action on formations | [8.6.2](#0x08-readsquadlistaction) |
+| `0x0B` | `ReadMove` | a move order; from clients only | [8.6.3](#0x0b-readmove) |
+| `0x0D` | `ReadNew` | a unit appears | [8.6.4](#0x0d-readnew) |
+| `0x0F` | `ReadFree` | an object is freed | [8.6.5](#0x0f-readfree--0x2b-readprojfree) |
+| `0x11` | `ReadDeath` | objects removed | [8.6.6](#0x11-readdeath) |
+| `0x13` | `ReadPlayer` | an object changes owner | [8.6.7](#0x13-readplayer) |
+| `0x15` | `ReadRally` | a rally point | [8.6.8](#0x15-readrally) |
+| `0x17` | `ReadOrder` | units sent to a target | [8.6.9](#0x17-readorder) |
+| `0x19` | `ReadUpgrade` | research starts / is cancelled | [8.6.10](#0x19-readupgrade) |
+| `0x1B` | `ReadProduce` | hire, cancel, infinite production | [8.6.11](#0x1b-readproduce) |
+| `0x1D` | `ReadSearch` | units search for enemies | [8.6.12](#0x1d-readsearch--0x1f-readstand--0x25-readleaveorder--0x35-readgate) |
+| `0x1F` | `ReadStand` | units hold ground | [8.6.12](#0x1d-readsearch--0x1f-readstand--0x25-readleaveorder--0x35-readgate) |
+| `0x21` | `ReadConstruct` | a building is placed | [8.6.13](#0x21-readconstruct) |
+| `0x23` | `ReadApply` | | [8.6.14](#0x23-readapply) |
+| `0x25` | `ReadLeaveOrder` | units leave a building | [8.6.12](#0x1d-readsearch--0x1f-readstand--0x25-readleaveorder--0x35-readgate) |
+| `0x27` | `ReadLeave` | a unit leaves | [8.6.15](#0x27-readleave) |
+| `0x29` | `ReadProj` | a projectile | [8.6.16](#0x29-readproj) |
+| `0x2B` | `ReadProjFree` | a projectile is freed | [8.6.5](#0x0f-readfree--0x2b-readprojfree) |
+| `0x2D` | `ReadNewP` | a field is sown | [8.6.17](#0x2d-readnewp) |
+| `0x2F` | `ReadStop` | units stop | [8.6.18](#0x2f-readstop--0x37-readfreelist) |
+| `0x31` | `ReadTrade` | a market trade | [8.6.19](#0x31-readtrade) |
+| `0x33` | `ReadWall` | a wall is laid | [8.6.20](#0x33-readwall) |
+| `0x35` | `ReadGate` | gates | [8.6.12](#0x1d-readsearch--0x1f-readstand--0x25-readleaveorder--0x35-readgate) |
+| `0x37` | `ReadFreeList` | objects freed | [8.6.18](#0x2f-readstop--0x37-readfreelist) |
+| `0x39` | `ReadPeaceTime` | peace time | [8.6.21](#0x39-readpeacetime) |
+| `0x3B` | `ReadSync` | a resync | [8.6.22](#0x3b-readsync) — **not decodable alone** |
+| `0x3D` | `ReadSyncUnitsParams` | hit points | [8.6.23](#0x3d-readsyncunitsparams) |
+| `0x40` | `ReadPackage` | a text package | [8.6.24](#0x40-readpackage) |
+| `0x46` | `ReadTradeResources` | resources given to an ally | [8.6.25](#0x46-readtraderesources) |
+
+### 8.4 Body values
+
+Section 3.2. Where a body starts with `bool8_t server`, it is 1 in the
+host's broadcast and 0 in a client's request.
+
+### 8.5 Progress records
+
+#### 0x08 ReadRes
+
+Resources on hand; only what changed.
+
+```cpp
+uint16_t players;             // bit = slot
+// then, for each slot in `players`:
+uint8_t  changed;             // bit r = resource r changed (11.2)
+uint8_t  compressed;          // bit r = the change is one byte
+// then, for each resource in `changed`, in order:
+uint8_t  delta;               // if compressed: bit 7 = negative, bits 0-6 = magnitude
+int32_t  inverted_amount;     // else: the amount, bit-inverted
+```
+
+> [!WARNING]
+> The game keeps amounts bit-inverted (`setres = not amount`): the amount is
+> `~inverted_amount`. A one-byte change applies to the amount:
+> `amount += (delta < 128 ? delta : −(delta − 128))`.
+
+#### 0x0A ReadStats
+
+The game's statistics, as running totals: the numbers of its end screen.
+
+```cpp
+uint32_t mask1;               // bits 0-11: slots present; bits 12+: groups (below)
+uint32_t mask2;               // groups (below)
+// then, for each slot in mask1 bits 0-11,
+//   for each group in the table's order,
+//     for each resource r = 1..6 whose bit is set:
+int32_t  value;
+```
+
+| Group | Mask | Bit for resource *r* | Game variable |
+|---|---|---|---|
+| total | `mask1` | 12 + *r* | `stat.restotal`: gathered |
+| upgrades | `mask1` | 18 + *r* | `stat.resonupgrade`: spent on upgrades |
+| mines | `mask1` | 24 + *r* | `stat.resonmines`: spent on mines |
+| units | `mask2` | *r* | `stat.resonunits`: spent on units (9.4) |
+| buildings | `mask2` | 6 + *r* | `stat.resonbuildings`: spent on buildings |
 | life | `mask2` | 12 + *r* | `stat.resonlife`: army upkeep |
 | buy | `mask2` | 18 + *r* | `stat.resbuy`: bought at the market |
 | sell | `mask2` | 24 + *r* | `stat.ressell`: sold at the market |
 
-- A bit is set when any player has a non-zero value; every player in
-  `mask1` then sends that value.
-- Sent about every 20 s, and at the end.
+A group's resource bit is set when **any** player has a non-zero value.
+Every slot in `mask1` then sends it.
 
-#### 6.5.3 `ReadLanSyncData` (progress 15) — workers and squads
+#### 0x0F ReadLanSyncData
 
-| Type | Field |
-|---|---|
-| `Word` | mask of players with economy data |
-| per player in the mask: | |
-| `Byte` | fields present: bit 0 idle peasants, 1 idle mines, 2–7 workers on food, wood, stone, gold, iron, coal |
-| if non-zero: `Byte` | the slot |
-| `Word` per bit set | the values |
-| then, for each of the 12 slots: | |
-| `Integer` | number of squads changed |
-| per squad: `Integer` uid, `Boolean` hold; if not hold: `Word` time | |
+```cpp
+uint16_t players;             // bit = slot with economy data
+// then, for each slot in `players`:
+uint8_t  fields;              // bit 0 idle peasants, 1 idle mines, 2-7 workers on food, wood, stone, gold, iron, coal
+uint8_t  slot;                // if fields != 0
+uint16_t value[];             // if fields != 0: one per bit set, in bit order
+// then, for each of the 12 slots:
+int32_t  count;               // squads changed
+struct {
+    int32_t  uid;
+    bool8_t  hold;
+    uint16_t time;            // if !hold
+} squads[count];
+```
 
-#### 6.5.4 `ReadNew` (13) — a unit appears
+### 8.6 Player records
 
-| Type | Field |
-|---|---|
-| `Boolean` | server |
-| `String` | race: `units` |
-| `String` | base: the unit's code (`musketeer`, `peaaus`…) |
-| `Float`, `Float` | x, z |
-| `Integer` | cid: **the producing building's uid** if > 0, else the nation |
-| `Integer` | uid of the new unit |
-| `Integer` | the player's number of objects after it |
+#### 0x06 ReadSquadNew
 
-- The owner is the record's owner.
-- A player's starting units are **not** announced: they only appear in sync
-  blocks (7.1).
+```cpp
+bool8_t server;
+int32_t player;
+str16_t formation;            // formation code
+int32_t form;
+int32_t officer_uid;
+int32_t drummer_uid;
+bool8_t position;
+bool8_t in_squad;
+int32_t squad;
+int32_t count;
+int32_t uid[count];           // the soldiers
+```
 
-#### 6.5.5 `ReadNewP` (45) — a field is sown
+#### 0x08 ReadSquadListAction
 
-| Type | Field |
-|---|---|
-| `Boolean` | server |
-| `String`, `String` | race `env`, base `field` |
-| `Float` × 3 | x, z, roll |
-| `Integer` | player: 12 (the environment owns fields) |
-| `Integer` | id |
-| `Integer` | uid |
-| `Integer` | number of objects |
+```cpp
+bool8_t server;
+int32_t action;
+bool8_t state;
+int32_t form;
+int32_t squad_count;
+int32_t squad[squad_count];
+int32_t count;
+int32_t uid[count];
+```
 
-The sowing player is the record's owner. One field per record; a sowing
-order produces a burst of them.
+#### 0x0B ReadMove
 
-#### 6.5.6 `ReadConstruct` (33) — a building is placed
+A client's move order, to the host. **The host does not broadcast it**: the
+movement shows in the sync blocks.
 
-| Type | Field |
-|---|---|
-| `Boolean` | server |
-| `Integer` | nation (the builder's) |
-| `String` | building code (`engcen`, `eurmil`…) |
-| `Float`, `Float` | x, z |
-| `Boolean` | clear the builders' orders |
-| uids | builders |
+```cpp
+float   dir_x;
+float   dir_z;
+bool8_t add;                  // add to the current orders
+bool8_t first;
+int32_t mode;
+int32_t count;
+struct { int32_t uid; float x; float z; } units[count];   // destinations
+uint16_t squad_uid;
+uint8_t  squad_player;        // if squad_uid != 0
+```
 
-- The building's own uid is not sent: each client creates the building
-  itself.
-- It shows up in the next sync blocks at (x, z); 7.1 explains how to find
-  it.
+#### 0x0D ReadNew
 
-#### 6.5.7 `ReadUpgrade` (25) — research starts
+A unit appears: hired, or out of a building.
 
-| Type | Field |
-|---|---|
-| `Boolean` | server |
-| `Integer` | upgrade index (7.5) |
-| `Boolean` | state: true start, false cancel |
-| uids | the buildings doing it |
+```cpp
+bool8_t server;
+str16_t race;                 // "units"
+str16_t base;                 // the unit's code, e.g. "musketeer", "peaaus"
+float   x;
+float   z;
+int32_t cid;                  // > 0: uid of the building that produced it; <= 0: the nation
+int32_t uid;                  // the new unit
+int32_t num;                  // the owner's number of objects after it
+```
 
-There is no record when the research ends.
+The unit's owner is the record's owner.
 
-#### 6.5.8 `ReadProduce` (27) — hire
+> [!NOTE]
+> A player's **starting units** (18 peasants by default) are never
+> announced. They only appear in sync blocks (9.1).
 
-| Type | Field |
-|---|---|
-| `Integer` | member id (the unit's index in its nation, 7.1) |
-| `Integer` | nation |
-| `Integer` | amount: > 0 queued, < 0 cancelled |
-| `Boolean` | state |
-| uids | the buildings |
+#### 0x0F ReadFree / 0x2B ReadProjFree
 
-#### 6.5.9 `ReadOrder` (23) — an order to a target
+```cpp
+int32_t uid;
+int32_t value;
+```
 
-| Type | Field |
-|---|---|
-| `Integer` | type (9.3): 2 attack, 3 gather, 13 enter a mine, 17 build, 18 guard, 19 repair… |
-| `Integer` | target uid |
-| `Boolean` | clear previous orders |
-| `Boolean` | lock the target |
-| `Integer` | n, the number of units |
-| if type is 5 (patrol) or 6 (attack a point): `Float`, `Float` | x, z |
-| `Integer` × n | the units |
+#### 0x11 ReadDeath
 
-#### 6.5.10 `ReadMove` (11) — a move order
+Objects removed by command (deleting a unit, destroying one's own building).
 
-A client's request to the host. **The host does not broadcast it:** it
-shows in the sync blocks instead.
+```cpp
+bool8_t server;
+int32_t mode;
+float   random_key;
+int32_t count;
+int32_t uid[count];
+```
 
-| Type | Field |
-|---|---|
-| `Float`, `Float` | direction x, z |
-| `Boolean` | add to orders |
-| `Boolean` | do first |
-| `Integer` | mode |
-| `Integer` | n |
-| n × (`Integer` uid, `Float` x, `Float` z) | destinations |
-| `Word` | squad uid |
-| if non-zero: `Byte` | the squad's player |
+> [!NOTE]
+> Deaths in combat are **not** sent this way. They show as a state change in
+> the sync blocks (8.7).
 
-#### 6.5.11 `ReadDeath` (17)
+#### 0x13 ReadPlayer
 
-| Type | Field |
-|---|---|
-| `Boolean` | server |
-| `Integer` | mode |
-| `Float` | random key |
-| uids | the objects |
+```cpp
+int32_t uid;
+bool8_t capture;              // the object was captured
+```
 
-Kills in combat are not sent this way; they show as a state change in the
-sync blocks (6.7).
+#### 0x15 ReadRally
 
-#### 6.5.12 Other records
+```cpp
+int32_t building_uid;
+bool8_t set;
+float   x;
+float   z;
+```
 
-| Section | Layout |
-|---|---|
-| `ReadSquadNew` (6) | `Boolean` server, `Integer` player, `String` formation code, `Integer` formation, `Integer` officer uid, `Integer` drummer uid, `Boolean` position, `Boolean` in squad, `Integer` squad, uids |
-| `ReadSquadListAction` (8) | `Boolean` server, `Integer` action, `Boolean` state, `Integer` formation, squads (count + `Integer` × n), uids |
-| `ReadFree` (15), `ReadProjFree` (43) | `Integer` uid, `Integer` |
-| `ReadPlayer` (19) | `Integer` uid, `Boolean` capture |
-| `ReadRally` (21) | `Integer` building uid, `Boolean` set, `Float` x, `Float` z |
-| `ReadSearch` (29), `ReadStand` (31), `ReadLeaveOrder` (37), `ReadGate` (53) | `Boolean` server, uids |
-| `ReadApply` (35) | `Integer` × 4 |
-| `ReadLeave` (39) | `Boolean` server, `Integer` uid |
-| `ReadProj` (41) | `Integer` uid, `Integer` target, `Boolean` use target position, `Float` × 3 from, `Integer` weapon, `Float` × 3 to, `Integer` nation, `Integer` id, `Integer` weapon index, `Float` random key, `Integer` projectile uid, `Integer` number of objects |
-| `ReadStop` (47), `ReadFreeList` (55) | uids |
-| `ReadTrade` (49) | `Boolean` server, `Byte` resource sold, `Byte` resource bought, `Integer` amount |
-| `ReadWall` (51) | `Boolean` server, `Byte` usage, `Byte` nation, `Byte` id; `Integer` n, n × (`Byte` sprite, `Float` x, `Float` z, `Integer` uid); `Integer` number of objects; uids (builders) |
-| `ReadPeaceTime` (57) | `Boolean` server |
-| `ReadSyncUnitsParams` (61) | `Integer` n, n × (`Integer` uid, `Boolean` valid, if valid: `Integer` hit points) |
-| `ReadPackage` (64) | `Boolean` server, `String` |
-| `ReadTradeResources` (70) | `Boolean` server, `Byte` from slot, `Byte` to slot, `Byte` resource, `Integer` amount |
-| `ReadSync` (59) | **Not decodable from the stream alone:** part of the layout depends on objects the reader already has. Skip it (6.8). |
+#### 0x17 ReadOrder
 
-### 6.6 End of record
+Units sent to a target: attack, gather, build, repair, enter.
 
-The byte after the body is always `0x01`. A decoder should check it: a
-missing `0x01` means the layout was wrong.
+```cpp
+int32_t type;                 // order type, 11.3
+int32_t target_uid;
+bool8_t clear;                // clear previous orders
+bool8_t lock;                 // keep the target
+int32_t count;
+float   x;                    // only if type is 5 (patrol) or 6 (attack a point)
+float   z;                    // only if type is 5 or 6
+int32_t uid[count];
+```
 
-### 6.7 Sync block
+#### 0x19 ReadUpgrade
 
-The engine's own unit sync. It is sent by the host only.
+```cpp
+bool8_t server;
+int32_t upgrade;              // index into the nation's upgrade list: 9.5
+bool8_t state;                // 1 = start, 0 = cancel
+int32_t count;
+int32_t building_uid[count];
+```
 
-| Offset | Size | Field |
+> [!NOTE]
+> There is no record when research ends. The start is all the stream says.
+
+#### 0x1B ReadProduce
+
+```cpp
+int32_t member;               // the unit's member id in its nation (9.1)
+int32_t cid;                  // nation
+int32_t amount;               // > 0: this many units; < 0: infinite production in |amount| buildings
+bool8_t state;                // 1 = queue, 0 = cancel
+int32_t count;
+int32_t building_uid[count];
+```
+
+> [!WARNING]
+> A negative `amount` is **not** a cancellation. It is
+> `gc_obj_order_produce_infinite` (−1): the building keeps producing the
+> unit until told otherwise (`_unit_ProduceUnit`). Cancellations have
+> `state` = 0. The units themselves show as `ReadNew`.
+
+#### 0x1D ReadSearch / 0x1F ReadStand / 0x25 ReadLeaveOrder / 0x35 ReadGate
+
+```cpp
+bool8_t server;
+int32_t count;
+int32_t uid[count];
+```
+
+#### 0x21 ReadConstruct
+
+```cpp
+bool8_t server;
+int32_t cid;                  // nation of the builder
+str16_t sid;                  // the building's code, e.g. "engcen", "eurmil"
+float   x;
+float   z;
+bool8_t clear;                // clear the builders' orders
+int32_t count;
+int32_t builder_uid[count];
+```
+
+> [!WARNING]
+> The building's own uid is **not** sent: every client creates the building
+> itself. It shows up in the next sync blocks at (x, z): see 9.1.
+
+#### 0x23 ReadApply
+
+```cpp
+int32_t a;
+int32_t b;
+int32_t c;
+int32_t d;
+```
+
+#### 0x27 ReadLeave
+
+```cpp
+bool8_t server;
+int32_t uid;
+```
+
+#### 0x29 ReadProj
+
+```cpp
+int32_t uid;                  // the shooter
+int32_t target_uid;
+bool8_t use_target_position;
+float   from_x, from_y, from_z;
+int32_t weapon;
+float   to_x, to_y, to_z;
+int32_t cid;
+int32_t id;
+int32_t weapon_index;
+float   random_key;
+int32_t projectile_uid;
+int32_t num;
+```
+
+#### 0x2D ReadNewP
+
+A field is sown. The sowing player is the record's owner.
+
+```cpp
+bool8_t server;
+str16_t race;                 // "env"
+str16_t base;                 // "field"
+float   x;
+float   z;
+float   roll;
+int32_t player;               // 12: the environment owns fields
+int32_t id;
+int32_t uid;
+int32_t num;
+```
+
+#### 0x2F ReadStop / 0x37 ReadFreeList
+
+```cpp
+int32_t count;
+int32_t uid[count];
+```
+
+#### 0x31 ReadTrade
+
+```cpp
+bool8_t server;
+uint8_t sell;                 // resource sold (11.2)
+uint8_t buy;                  // resource bought
+int32_t amount;
+```
+
+#### 0x33 ReadWall
+
+```cpp
+bool8_t server;
+uint8_t usage;
+uint8_t cid;
+uint8_t id;
+int32_t piece_count;
+struct { uint8_t sprite; float x; float z; int32_t uid; } pieces[piece_count];
+int32_t num;
+int32_t count;
+int32_t builder_uid[count];
+```
+
+#### 0x39 ReadPeaceTime
+
+```cpp
+bool8_t server;
+```
+
+#### 0x3B ReadSync
+
+A resync of objects. The layout depends on objects the reader already has:
+a present object is followed by its full state only if the reader cannot
+find it.
+
+```cpp
+bool8_t server;
+int32_t count;
+struct {
+    int32_t uid;
+    bool8_t exists;
+    // if exists and the reader has no such object: race, base (str16_t),
+    // position, scale, up and direction vectors, state tag, order, ...
+} objects[count];
+```
+
+> [!WARNING]
+> An observer cannot know which objects "the reader" has. Skip this record
+> (8.8).
+
+#### 0x3D ReadSyncUnitsParams
+
+```cpp
+int32_t count;
+struct {
+    int32_t uid;
+    bool8_t valid;
+    int32_t hp;               // if valid: hit points
+} units[count];
+```
+
+#### 0x40 ReadPackage
+
+```cpp
+bool8_t server;
+str16_t text;
+```
+
+#### 0x46 ReadTradeResources
+
+```cpp
+bool8_t server;
+uint8_t from_slot;
+uint8_t to_slot;
+uint8_t resource;
+int32_t amount;
+```
+
+### 8.7 Sync block
+
+The engine's own unit sync, from the host.
+
+```cpp
+struct sync_entry
+{
+    uint24_t uid;
+    uint8_t  flags;
+    uint32_t tag;             // if flags & 0x08: state tag
+    uint24_t target_uid;      // if flags & 0x01: the target of the action
+    float    x, z;            // if flags & 0x02: position
+    float    direction;       // if flags & 0x04
+};
+```
+
+**Flags:**
+
+| Bit | Mask | Field |
 |---|---|---|
-| 0 | 1 | `0x09` |
-| 1 | 3 | unknown: changes from block to block, wraps around |
-| 4 | 4 | `u32` n, the number of entries |
-| 8 | … | n entries |
+| 0 | `0x01` | target uid (3 bytes) |
+| 1 | `0x02` | position (8 bytes) |
+| 2 | `0x04` | direction (4 bytes) |
+| 3 | `0x08` | state tag (4 bytes) |
+| 4 | `0x10` | set with `0x08`; no data |
+| 5–7 | `0xE0` | never set: a reader should treat them as "not a sync block" |
 
-Entry:
+Fields follow in the order tag, target, position, direction.
 
-| Size | Field | Present if |
-|---|---|---|
-| 3 | uid (24-bit) | always |
-| 1 | flags | always |
-| 4 | state tag (`u32`, below) | flags & `0x08` |
-| 3 | target uid (24-bit) | flags & `0x01` |
-| 8 | x, z (`Float` × 2) | flags & `0x02` |
-| 4 | direction (`Float`) | flags & `0x04` |
+**State tag** (`gc_statetag_*`):
 
-- Bit `0x10` is set with `0x08` and adds no data.
-- Bits `0x20`–`0x80` were never seen. Treat them as "not a sync block".
-
-**State tag** (`gc_statetag_*`), one bit each:
-
-| Bit | Name | Bit | Name |
+| Bit | Mask | Name | Meaning |
 |---|---|---|---|
-| 0 | `essential_none`: normal life | 16 | `resource_none` |
-| 1 | `essential_birth`: under construction | 17 | `resource_food` |
-| 2 | `essential_death`: dead | 18 | `resource_wood` |
-| 3 | `move_idle` | 19 | `resource_stone` |
-| 4 | `move_walk` | 20 | `visual_none` |
-| 5 | `move_turn` | 21 | `visual_stage_0` |
-| 6 | `action_none` | 22 | `visual_stage_1` |
-| 7 | `action_attack` (target = victim) | 23 | `visual_stage_2` |
-| 8 | `action_build` | 24 | `visual_stage_3` |
-| 9 | `action_extract` | 25 | `visual_hide` |
-| 10 | `execute_none` | 29 | `sync_stp` |
-| 11 | `execute_move` | 30 | `sync_endpoint` |
-| 12 | `weapon_none` | | |
-| 13–15 | `weapon_0` … `weapon_2` | | |
+| 0 | `0x00000001` | `essential_none` | normal life |
+| 1 | `0x00000002` | `essential_birth` | being born: a building under construction |
+| 2 | `0x00000004` | `essential_death` | dying / dead |
+| 3 | `0x00000008` | `move_idle` | |
+| 4 | `0x00000010` | `move_walk` | |
+| 5 | `0x00000020` | `move_turn` | |
+| 6 | `0x00000040` | `action_none` | |
+| 7 | `0x00000080` | `action_attack` | the target is the victim |
+| 8 | `0x00000100` | `action_build` | |
+| 9 | `0x00000200` | `action_extract` | gathering |
+| 10 | `0x00000400` | `execute_none` | |
+| 11 | `0x00000800` | `execute_move` | |
+| 12 | `0x00001000` | `weapon_none` | |
+| 13–15 | `0x0000E000` | `weapon_0` … `weapon_2` | |
+| 16 | `0x00010000` | `resource_none` | |
+| 17–19 | `0x000E0000` | `resource_food`, `_wood`, `_stone` | carrying |
+| 20 | `0x00100000` | `visual_none` | |
+| 21–24 | `0x01E00000` | `visual_stage_0` … `_3` | construction stages |
+| 25 | `0x02000000` | `visual_hide` | |
+| 29 | `0x20000000` | `sync_stp` | |
+| 30 | `0x40000000` | `sync_endpoint` | |
 
-### 6.8 Decoding robustly
+### 8.8 Decoding robustly
 
-A reader that meets a section it cannot decode (`ReadSync`, or a future
-one) can resynchronise:
+A reader that meets a record it cannot decode — `ReadSync`, or a section
+added by a later version — can still find the next block:
 
-1. Look for the next `0x01` after the header.
-2. If it is followed by the end of the payload, by a record header
-   (`00 03 xx xx 00`), or by a sync block that decodes completely, the
-   unknown record ends at that `0x01`.
-3. Otherwise try the next `0x01`.
-
-Stop at a byte that is neither `0x00` nor `0x09`.
+```
+decode(payload):
+    pos = 0
+    while pos < len(payload):
+        if payload[pos] == 0x09:                      # sync block
+            decode entries; if any flag in 0xE0 or data runs out: stop
+        elif payload[pos:pos+2] == 00 03 and payload[pos+4] == 0x00:   # record
+            if the section's layout is known and the body ends right before a 0x01:
+                emit it; pos = after the 0x01
+            else:
+                q = next 0x01 after the header
+                until q is followed by: the end, a record header, or a sync block that decodes
+                    q = next 0x01
+                emit "unknown record"; pos = q + 1
+        else:
+            stop
+```
 
 ---
 
-## 7. What the data means
+## 9. What the data means
 
-### 7.1 Objects and their owners
+### 9.1 Objects and owners
 
-| Object | Created | Owner known from |
+| Object | Created by | Owner |
 |---|---|---|
-| Hired unit | `ReadNew` | the record's owner |
-| Starting unit (18 peasants by default…) | at the map start, never announced | the nearest town centre; they move from the first seconds |
-| Building | `ReadConstruct` (placement) | find the uid that first appears in a sync block within ~1 unit of (x, z), at or after the placement |
-| Field | `ReadNewP` | the record's owner (the uid's owner is the environment) |
-| Tree, stone, map object | map | never moves |
+| hired unit | `ReadNew` | the record's owner |
+| starting unit (18 peasants by default) | the map start, never announced | the nearest town centre; they move from the first seconds |
+| building | `ReadConstruct` | the record's owner. Its uid: the first new uid in a sync block within ~1 unit of (x, z), at or after the placement |
+| field | `ReadNewP` | the record's owner (the uid's owner is the environment) |
+| tree, stone, map object | the map | nobody; they never move |
 
-- Unit and building **codes** are the members of the nation in
-  `country.script` (`_country_AddMember`).
-- The game's statistics index them as `[nation][member id]`, member id =
-  the order of `_country_AddMember` calls for that nation. Index 0 is
-  `null`.
+- Unit and building codes are the nation's **members** in `country.script`
+  (`_country_AddMember`).
+- The game's statistics index them as `[nation][member id]`. The member id
+  is the order of those calls for the nation, from 0 (`null`).
 
-### 7.2 Life cycle in sync blocks
+### 9.2 Life cycle in sync blocks
+
+```mermaid
+stateDiagram-v2
+    [*] --> Construction: ReadConstruct (building)
+    Construction --> Alive: essential_birth → essential_none
+    [*] --> Alive: ReadNew (unit)
+    Alive --> Dead: essential_death
+    Construction --> Dead: destroyed unfinished
+    Dead --> [*]
+```
 
 - **Construction.** While a building is being built, its tag has
-  `essential_birth` and one of `visual_stage_0` … `visual_stage_3`. When it is
-  finished, `essential_birth` gives way to `essential_none`. A mill placed at
-  0:02 might be finished at 0:31.
-- **Death.** `essential_death` appears; the object then disappears.
-- **Attack.** `action_attack` with a target uid: the attacker's latest
-  victim. Credit a death to the last attacker of the victim.
-- **End of match.** After the results (5.5), the game removes the losers'
-  units: a burst of deaths that are not combat losses.
+  `essential_birth` and one of `visual_stage_0` … `_3`. The moment
+  `essential_none` replaces `essential_birth`, it is finished. A mill
+  placed at 0:02 might be finished at 0:31.
+- **Attack.** `action_attack` with a target: credit a death to the victim's
+  last attacker.
 
-### 7.3 Resources on hand
+> [!WARNING]
+> **After the results** (6.3.2) the game removes the losers' units: a burst
+> of deaths within seconds of the result. They are not combat losses.
 
-- Use `ReadRes` (6.5.1), and remember the inversion.
-- Starting resources appear as the first absolute values (for example 4300
-  of each with "thousands").
+### 9.3 Resources on hand
 
-### 7.4 The game's statistics (`ReadStats`)
+- Use `ReadRes`, and remember the inversion (8.5.1).
+- The first absolute values include the starting resources: 4300 of each
+  with "thousands" on 2.2.3 random maps.
 
-These are the numbers of the game's end screen. Some behave in ways that
-matter:
+### 9.4 The game's statistics
 
-- **`total`** is everything gathered.
-  `total − spent + bought − sold + starting resources` equals what is on hand
-  (`ReadRes`).
-- **`units`** (the end screen's unit spending) is **not** the price of the
-  units made:
-  1. **Sown fields are in it**: 5 gold each. A field is not a building, so
-     `_unit_ApplyCostByID` books it as a unit.
-  2. **A cancelled hire counts twice.** `_unit_CancelUnitProduction` refunds
-     the player but *adds* the refund to `resonunits` (for upgrades it
-     subtracts). This is a game bug.
-  3. **A unit is paid when its production starts**, so units being produced
-     at the end are in it.
-- **`units lost`** on the end screen (`stat.killed[nation][member]`) are the
-  **owner's losses**. The game counts a death for the object's owner, and
-  does not record who killed it.
-- **`produced`** counts a building only once it is **finished**.
+`ReadStats` carries the numbers of the game's end screen. Some behave in
+unexpected ways:
 
-### 7.5 Upgrades
+- `total` is everything gathered:
+  `total − spent + bought − sold + starting resources` = on hand.
 
-`ReadUpgrade` sends an **index** into the nation's upgrade list.
-`country.script` builds the list when the game starts (`_country_Init`): an
-upgrade id takes the first free slot when it is first added. So:
+> [!WARNING]
+> **`units` is not the price of the units made.** It also contains:
+>
+> 1. **Sown fields**, 5 gold each. A field is not a building, so the game
+>    books it as a unit (`_unit_ApplyCostByID`).
+> 2. **Cancelled hires, twice.** `_unit_CancelUnitProduction` refunds the
+>    player but *adds* the refund to `resonunits` (for upgrades it
+>    subtracts). This is a game bug.
+> 3. **Units in production at the end.** A unit is paid when its production
+>    starts.
 
-- index 0 is `null`;
-- index 1 is `<nation>cen.1`, the 18th century, for nations that have it
-  (not Ukraine, Turkey, Algeria, Scotland);
-- the rest follows the script: building upgrades, then unit trainings.
+> [!WARNING]
+> The end screen's **units lost** (`stat.killed[nation][member]`) are the
+> **owner's losses**. The game counts a death for the object's owner, and
+> does not record who killed it.
 
-The order depends on the script version. Rebuild it from the installed game.
-The reference implementation runs the game's own `_country_InitAll` with a
-small interpreter (`c3net.upgrades`).
+- **Produced** counts a building only once it is finished.
 
-Upgrade ids:
+### 9.5 Upgrades
+
+`ReadUpgrade.upgrade` is an **index** into the nation's upgrade list. The
+list is built by `country.script` (`_country_Init`) when the game starts:
+an upgrade id takes the first free slot when it is first added.
+
+- 0 is `null`.
+- 1 is `<nation>cen.1`, the 18th century, for nations that have one (all
+  but Ukraine, Turkey, Algeria and Scotland).
+- The rest follows the script: building upgrades, then unit trainings.
+  England's index 40 is `engbla.1`; 106–114 are its 17th-century
+  musketeers' trainings.
+
+> [!NOTE]
+> The order depends on the script version. Rebuild it from the installed
+> game: `python -m c3net upgrades <game folder>` runs the game's own
+> `_country_InitAll`.
+
+**Upgrade ids:**
 
 | Form | Meaning |
 |---|---|
-| `<nation><place>.<n>` | upgrade *n* of a building: `aca` academy, `bla` blacksmith, `mil` mill, `cen` town centre, `tow` towers, `gol` / `iro` / `coa` mines, `por` port… (`eur` / `rus` / `tur` replace the nation for shared ones) |
-| `<nation><place>.<unit>.1.<level>` | the unit's attack training, level *level* |
+| `<nation><place>.<n>` | upgrade *n* of a building: `aca` academy, `bla` blacksmith, `mil` mill, `cen` town centre, `tow` towers, `gol` / `iro` / `coa` mines, `por` port… `eur`, `rus`, `tur` replace the nation where upgrades are shared |
+| `<nation><place>.<unit>.1.<level>` | the unit's attack training at *level* |
 | `<nation><place>.<unit>.2.<level>` | its defense training; for artillery, build time |
 
-- Mine upgrades are researched per mine, so the same index can come several
-  times.
-- A few upgrades change prices (`gc_upg_type_priceperc`): the fishing boat,
-  one academy upgrade, and artillery.
+- Mine upgrades are researched per mine, so the same index repeats.
+- A few upgrades change unit prices (`gc_upg_type_priceperc`): the fishing
+  boat, one academy upgrade, and artillery.
 
-### 7.6 Score
+### 9.6 Score
 
-The game's score (`counter.scores`) is not sent. It can be rebuilt from its
-rules:
+The game's score (`counter.scores`) is never sent. It can be rebuilt with
+its rules:
 
 | Event | Change |
 |---|---|
-| a unit appears | + its `score` (unit data) |
+| a unit appears | + its score (unit data) |
 | a building is **finished** | + its score |
-| an object dies | − 2 × its score for the owner (a building only if it was finished), floored at 0 |
+| an object dies | − 2 × its score for the owner (a building only if it was finished); never below 0 |
 | a kill | + 2 × the victim's score for the killer |
 
 The end screen shows the score divided by 100.
 
 ---
 
-## 8. QLREC1 recordings
+## 10. QLREC1 recordings
 
-The format written by the QLadder recorder (a Sich module) for every room
-that started a match. It is not part of the game. The reference
-implementation reads it.
+The file format of the QLadder recorder (a Sich module): every frame the
+members of a started room sent. It is not part of the game.
 
 ```
-"QLREC1\n"
-repeat:
-    u32  ms since the room was created
-    u32  payload length
-    u16  code
-    u32  id from
-    u32  id to
-    ...  payload
+"QLREC1\n" ~~~ Entry ~~~ Entry ~~~ ...
 ```
 
-- The frames are those room members sent, as the server received them.
-- Code `0xFFFF` is a marker of the recorder: a JSON object with `ev` =
-  `create`, `join`, `leave`, `lock`, `master` or `close`.
-- Private messages (`SERVER_MESSAGE`) are never recorded.
+```cpp
+struct qlrec1_entry
+{
+    uint32_t ms;              // since the room was created
+    uint32_t length;
+    uint16_t code;            // as in the frame; 0xFFFF = recorder marker
+    uint32_t id_from;
+    uint32_t id_to;
+    uint8_t  payload[length];
+};
+```
+
+- Markers (`0xFFFF`) are JSON objects with `ev` = `create`, `join`,
+  `leave`, `lock`, `master` or `close`.
+- Private messages (`0x0196`) are never recorded.
 - Files may be gzip-compressed.
 
 ---
 
-## 9. Constants
+## 11. Enumerations
 
-### 9.1 Nations
+### 11.1 Nations
 
 | Id | Nation | Id | Nation | Id | Nation |
 |---|---|---|---|---|---|
@@ -870,33 +1775,73 @@ repeat:
 | 6 | Poland | 14 | Denmark | 22 | *(Tatars, not playable)* |
 | 7 | Sweden | 15 | Portugal | 23 | *(Lithuania, not playable)* |
 
-- In the datasync, 24 and more mean "random".
-- -2 is a spectator.
+In the datasync, 24 and more mean "random". −2 is a spectator.
 
-### 9.2 Resources
+### 11.2 Resources
 
-`gc_resource_type_*`: 0 none, 1 food, 2 wood, 3 stone, 4 gold, 5 iron,
-6 coal.
+```cpp
+enum resource    // gc_resource_type_*
+{
+    NONE  = 0,
+    FOOD  = 1,
+    WOOD  = 2,
+    STONE = 3,
+    GOLD  = 4,
+    IRON  = 5,
+    COAL  = 6,
+};
+```
 
-### 9.3 Order types
+### 11.3 Order types
 
-`gc_obj_order_type_*`:
+```cpp
+enum order_type  // gc_obj_order_type_*
+{
+    NONE                  = 0,
+    MOVE                  = 1,
+    ATTACK_OBJECT         = 2,
+    GATHER                = 3,
+    PRODUCE               = 4,
+    PATROL                = 5,   // ReadOrder carries x, z
+    ATTACK_POINT          = 6,   // ReadOrder carries x, z
+    CONTINUE_ATTACK_POINT = 7,
+    PERFORM_UPGRADE       = 8,
+    FISHING               = 9,
+    CREATE_GATES          = 10,
+    BUILD_WALL_CONTINUE   = 11,
+    BUILD_WALL            = 12,
+    GO_TO_MINE            = 13,
+    GO_TO_TRANSPORT       = 14,
+    LEAVE_TRANSPORT       = 15,
+    LEAVE_BUILDING        = 16,
+    BUILD                 = 17,
+    GUARD                 = 18,
+    REPAIR                = 19,
+    EXIT_UNITS            = 20,
+};
+```
 
-| Id | Order | Id | Order |
-|---|---|---|---|
-| 0 | none | 11 | build wall (continue) |
-| 1 | move | 12 | build wall |
-| 2 | attack an object | 13 | go into a mine |
-| 3 | gather | 14 | board a transport |
-| 4 | produce | 15 | leave a transport |
-| 5 | patrol | 16 | leave a building |
-| 6 | attack a point | 17 | build |
-| 7 | keep attacking a point | 18 | guard |
-| 8 | upgrade | 19 | repair |
-| 9 | fish | 20 | unload units |
-| 10 | create gates | | |
+### 11.4 Victory states
 
-### 9.4 Other
+```cpp
+enum victory_state  // gc_player_victorystate_*
+{
+    NONE = 0,
+    WIN  = 1,
+    LOSE = 2,
+};
+```
+
+### 11.5 Computer difficulty
+
+| Value | Difficulty |
+|---|---|
+| 0 | normal |
+| 1 | hard |
+| 2 | very hard |
+| 3 | impossible |
+
+### 11.6 Game constants
 
 | Name | Value |
 |---|---|
@@ -905,7 +1850,8 @@ repeat:
 | `gc_MaxCountryCount` | 24 |
 | `gc_country_maxmembers` | 80 |
 | `gc_country_maxupgradecount` | 320 |
-| `gc_spectator_countryid` | -2 |
+| `gc_spectator_countryid` | −2 |
+| `gc_playerind_env` / `misc` / `progress` / `pool` | 12 / 13 / 14 / 15 |
 
 ---
 
@@ -916,10 +1862,10 @@ All from a recorded 2.2.3 match.
 **`ReadRes`**: both players' food goes down by 1 (their units eat).
 
 ```
-00 03 0e 08 00       record, owner 14 (progress), section 8 (ReadRes)
-03 00                players 0 and 1
-02 02 81             player 0: changed = food (bit 1), sent as one byte: 0x81 = -1
-02 02 81             player 1: the same
+00 03 0e 08 00       record, owner 0x0E (progress), section 0x08 ReadRes
+03 00                players: slots 0 and 1
+02 02 81             slot 0: changed = food (bit 1), one byte: 0x81 = −1
+02 02 81             slot 1: the same
 01                   end
 ```
 
@@ -927,57 +1873,64 @@ All from a recorded 2.2.3 match.
 
 ```
 00 03 0e 0a 00                   ReadStats
-03 00 00 00                      mask1: players 0, 1
-02 23 00 00                      mask2: units food (bit 1), buildings wood (8), stone (9), life food (13)
-00 00 00 00                      player 0 units: food 0
-3e 03 00 00 b6 03 00 00          player 0 buildings: wood 830, stone 950
-32 00 00 00                      player 0 life: food 50
-c8 00 00 00                      player 1 units: food 200
-0e 0b 00 00 86 0b 00 00          player 1 buildings: wood 2830, stone 2950
-32 00 00 00                      player 1 life: food 50
+03 00 00 00                      mask1: slots 0, 1
+02 23 00 00                      mask2: units food (bit 1), buildings wood (8) and stone (9), life food (13)
+00 00 00 00                      slot 0, units:     food 0
+3e 03 00 00 b6 03 00 00          slot 0, buildings: wood 830, stone 950
+32 00 00 00                      slot 0, life:      food 50
+c8 00 00 00                      slot 1, units:     food 200
+0e 0b 00 00 86 0b 00 00          slot 1, buildings: wood 2830, stone 2950
+32 00 00 00                      slot 1, life:      food 50
 01
 ```
 
 **`ReadConstruct`**: the computer (slot 1, Saxony) places a town centre.
 
 ```
-00 03 01 21 00           owner 1, section 33
+00 03 01 21 00           owner 1, section 0x21 ReadConstruct
 01                       server
-11 00 00 00              nation 17 (Saxony)
+11 00 00 00              cid 17: Saxony
 06 00 73 61 78 63 65 6e  "saxcen"
-00 80 c8 42 00 80 cc 42  x 100.25, z 102.25
+00 80 c8 42              x 100.25
+00 80 cc 42              z 102.25
 00                       keep orders
 00 00 00 00              no builders
 01
 ```
 
-**`ReadNew`**: a peasant leaves the town centre (uid 9824).
+**`ReadNew`**: a peasant comes out of the town centre (uid 9824).
 
 ```
-00 03 01 0d 00                       owner 1, section 13
+00 03 01 0d 00                       owner 1, section 0x0D ReadNew
 01                                   server
 05 00 75 6e 69 74 73                 "units"
 06 00 70 65 61 61 75 73              "peaaus"
 52 b8 cb 42 f6 a8 d0 42              x 101.86, z 104.33
 60 26 00 00                          produced by uid 9824
-b5 26 00 00                          new uid 9909
+b5 26 00 00                          the new uid: 9909
 18 00 00 00                          24 objects
 01
 ```
 
-**`ReadUpgrade`**: the computer starts upgrade 2 (a mill upgrade) in uid 9825.
+**`ReadProduce`**: slot 1 queues 2 peasants (member 1 of Saxony) in uid 9824.
+
+```
+00 03 01 1b 00  01 00 00 00  11 00 00 00  02 00 00 00  01  01 00 00 00  60 26 00 00  01
+```
+
+**`ReadUpgrade`**: slot 1 starts upgrade 2 (a mill upgrade) in uid 9825.
 
 ```
 00 03 01 19 00  01  02 00 00 00  01  01 00 00 00  61 26 00 00  01
 ```
 
-**`ReadOrder`**: player 0 sends 37 units to attack uid 9949.
+**`ReadOrder`**: slot 0 sends 37 units to attack uid 9949.
 
 ```
 00 03 00 17 00
 02 00 00 00      type 2: attack an object
 dd 26 00 00      target 9949
-01 00            clear orders, no lock
+01 00            clear orders; no lock
 25 00 00 00      37 units
 31 27 00 00 ...  their uids
 01
@@ -989,11 +1942,11 @@ dd 26 00 00      target 9949
 09 6b 78 01              sync, key 0x01786b
 01 00 00 00              1 entry
 5f 26 00                 uid 9823
-1e                       flags: tag, position, direction
-61 14 11 60              tag: none, turn, action_none, execute_none, weapon_none,
+1e                       flags: tag, position, direction (and 0x10)
+61 14 11 60              tag 0x60111461: none, turn, action_none, execute_none, weapon_none,
                               resource_none, visual_none, sync_stp, sync_endpoint
 16 ab c6 42 23 e5 c6 42  x 99.33, z 99.45
-00 ce 8f c2              direction -71.9
+00 ce 8f c2              direction −71.9
 ```
 
 **Sync block**: an object dies.
@@ -1006,15 +1959,15 @@ dd 26 00 00      target 9949
 
 ## Appendix B. Reference implementation
 
-[`c3net`](c3net/) is a dependency-free Python 3.9+ package:
+[`c3net`](c3net/) is a Python 3.9+ package with no dependencies:
 
 | Module | Covers |
 |---|---|
-| `c3net.lobby` | frames (4.1), parser trees (3.3), codes and parser ids, results (5.5) |
-| `c3net.room` | game name (5.1), lobby status (5.2), datasync (5.3) |
-| `c3net.stream` | the match stream (section 6) |
-| `c3net.recording` | QLREC1 files (section 8) |
-| `c3net.upgrades` | upgrade lists from an installed game (7.5) |
+| `c3net.lobby` | frames (4.1), parser trees (6.1), message codes and parser ids, results, session messages |
+| `c3net.room` | game name (7.1), lobby status (7.2), room datasync (6.3.1) |
+| `c3net.stream` | the match stream (section 8): `parse()` yields `Record` and `Sync` blocks |
+| `c3net.recording` | QLREC1 files (section 10) |
+| `c3net.upgrades` | upgrade lists rebuilt from an installed game (9.5) |
 | `c3net.dmscript` | an interpreter for the game's script language, enough for `country.script` |
 
 ```
@@ -1027,4 +1980,5 @@ python -m c3net upgrades "C:/Games/Cossacks 3"
 
 | Revision | Date | Changes |
 |---|---|---|
+| 0.2 | 2026-09-26 | Every lobby message code, with direction and payload structs. Parser definitions, including the game clock (parser 16). Record types by hex section, with a struct for each. Sync flags and state tags as bit tables, the robust decoding algorithm, sequence and state diagrams. **Corrections:** `ReadProduce` with a negative `amount` is infinite production, not a cancellation (`state` = 0 is); the room datasync comes as `SERVER_SESSION_PARSER`, which reaches the whole room, not only the master. |
 | 0.1 | 2026-09-26 | First version. |

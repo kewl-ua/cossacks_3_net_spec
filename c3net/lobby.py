@@ -1,4 +1,4 @@
-"""The lobby transport: frames, values and parser trees. See cossacks3-net.md, section 3.
+"""The lobby transport: frames, values and parser trees. See cossacks3-net.md, sections 4 and 6.
 
 Every message between a game client and the lobby server (TCP, port 31523 by
 default) is a frame: a 14-byte header and a payload. In a room, the server
@@ -147,5 +147,5 @@ def session_lock(data: bytes) -> list:
 
 
 def clscore(data: bytes) -> tuple:
-    """SERVER_SESSION_CLSCORE: (player id, result code), see section 4.6."""
+    """SERVER_SESSION_CLSCORE: (player id, result code), see section 7.4."""
     return struct.unpack("<Ii", data[:8])
