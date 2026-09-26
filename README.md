@@ -1,4 +1,4 @@
-# cossacks_3_server
+# cossacks_3_net_spec
 
 What travels between **Cossacks 3** and its lobby server during an online game,
 documented byte by byte — and a Python parser for it.
@@ -24,8 +24,8 @@ players' side.
 ## Quick start
 
 ```
-git clone https://github.com/kewl-ua/cossacks_3_server
-cd cossacks_3_server
+git clone https://github.com/kewl-ua/cossacks_3_net_spec
+cd cossacks_3_net_spec
 python -m c3net dump match.rec.gz        # every frame of a recording, decoded
 python -m c3net summary match.rec.gz     # per player: units, buildings, upgrades, losses, statistics
 ```

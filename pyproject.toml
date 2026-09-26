@@ -15,7 +15,7 @@ dependencies = []
 c3net = "c3net.__main__:main"
 
 [project.urls]
-Specification = "https://github.com/kewl-ua/cossacks_3_server/blob/main/cossacks3-net.md"
+Specification = "https://github.com/kewl-ua/cossacks_3_net_spec/blob/main/cossacks3-net.md"
 
 [tool.setuptools]
 packages = ["c3net"]
