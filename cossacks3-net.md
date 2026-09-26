@@ -79,9 +79,9 @@ Not covered:
 - **Statistics** (section 9) were compared with the game's end screen and
   balance to the unit once 9.4 is applied.
 - **Lobby payloads** (section 5) follow Sich, which serves the game.
-- **Not yet verified:** the recordings were one human against computer
-  players. What only happens between two humans (client requests in 8.3,
-  parser 16) follows the scripts but has not been observed.
+- **Two humans:** checked on a match of two players (and two computers):
+  the client's requests to the host (8.3), parser 16 (6.3.3), parser 1
+  (6.3.5) and a lobby server's pause (8.9).
 
 ### 1.3 Conventions
 
@@ -829,7 +829,7 @@ The root's key may name the tree (the datasync's root is `tmp`, with value
 
 | Id | Name | Sent by | Carries |
 |---|---|---|---|
-| 1 | `LAN_GENERATE` | | map generation |
+| 1 | `LAN_GENERATE` | host | the map's recipe: [6.3.5](#635-1-lan_generate) |
 | 2 | `LAN_READYSTART` | | |
 | 3 | `LAN_START` | | |
 | 4 | `LAN_ROOM_READY` | | |
@@ -957,11 +957,43 @@ speed.
 | Key | Value |
 |---|---|
 | `t` | game time, seconds (decimal text) |
-| `s` | the time speed factor |
+| `s` | the time speed factor: 7 normal, 10 fast, 14 very fast (`gc_settings_gamespeed_*`) |
+
+Game time runs at `s / 10` of real time: at 14 ("very fast"), 7 game
+seconds pass in 5 real seconds. The first three of a recorded match:
+
+```
+t = 1.47273135185242   s = 14
+t = 8.52007389068604   s = 14      5.0 s later
+t = 15.5319519042969   s = 14      5.0 s later
+```
 
 > [!NOTE]
-> In a match against computer players only, there is no parser 16. Use the
-> arrival time of the stream then (8.1).
+> In a match against computer players only, there is no parser 16. The
+> speed is still in the host's `ReadTimeSpeed` (8.9) and the room settings
+> (6.3.1, field 29): game time = playing time × speed / 10.
+
+#### 6.3.5 1 LAN_GENERATE
+
+When the room has more than one human, the host sends its whole `gMap`
+before the start (`StateMachineGlobalVariablesSaveToParser`): the recipe of
+the map, for every client to generate the same one. About 7 KB. The keys
+follow the script's `TMap` class:
+
+```
+(root: tmp)
+├ name, gamestage, lastenvuid, dlcs, brating, bbattle, battlestage, battleind, battlemap
+├ settings
+│  ├ gen
+│  │  ├ randkey0, randkey1     the map's seed
+│  │  ├ mapsize, terraintype, relieftype, resourcestart, resourcemines, season
+│  └ additional ...           as in the datasync (6.3.1)
+├ players ...                 the 12 slots
+└ playersinfo ...
+```
+
+A recorded match: `randkey0 = 0`, `randkey1 = 763381496`, `mapsize = 3`
+(small), `terraintype = 0` (land), `relieftype = 2` (mountains).
 
 #### 6.3.4 102 LAN_ROOM_CLIENT_DATACHANGE
 
@@ -1648,7 +1680,7 @@ match. The host broadcasts them; a client sends one to ask for a change.
 #### 0x0040 ReadTimeSpeed
 
 ```cpp
-float   speed;                // the time speed factor
+float   speed;                // the time speed factor: 7, 10 or 14 (6.3.3)
 int32_t mode;                 // gc_settings_gamespeed index: 0 normal, 1 fast, 2 very fast
 ```
 
@@ -1808,6 +1840,14 @@ The end screen shows the score divided by 100.
 - The host's `ReadPause` (8.9) broadcasts give the pauses: `true` when the
   game stops, `false` when it goes on. Only the host sends them, whoever
   pressed the key.
+- The game clock runs at speed / 10 of real time (6.3.3): 1.4 × at "very
+  fast". Times measured on the stream's arrival are playing time; multiply
+  by speed / 10 for the game's own clock, or take parser 16.
+- The pause is a toggle, and the players can press it too. A server that
+  pauses a match should follow the host's broadcasts and send only when the
+  state must change; blind toggles race with the players (seen in a live
+  match: a second toggle, meant to resume, paused again after a player had
+  resumed).
 - During a pause the stream nearly stops, but real time goes on. Game time
   is the arrival time minus the pauses before it. Without that, everything
   after a pause is late by the pause's length.
