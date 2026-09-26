@@ -225,3 +225,14 @@ def test_dmscript_interpreter():
     assert ids == ["null", "engcen.1", "engbar.musketeer.1.1", "engbar.musketeer.1.3"]
     consts = dmscript.read_constants("gc_a = 2;\ngc_b = gc_a shl 3;\n")
     assert consts == {"gc_a": 2, "gc_b": 16}
+
+
+def test_gui_records():
+    # the host's pause, as in a recorded match: 00 04, section 66 (u16), the Boolean, 01; a record after it
+    payload = bytes.fromhex("000442000101") + rec(stream.OWNER_PROGRESS, 8, b"\x01\x00\x02\x02\x81")
+    blocks = list(stream.parse(payload))
+    assert blocks[0] == stream.Record(stream.OWNER_GUI, 66, "ReadPause", {"pause": 1})
+    assert blocks[1].name == "ReadRes" and blocks[1].fields["players"] == {0: {"food": ("delta", -1)}}
+    # an unknown GUI section is skipped to the next block
+    blocks = list(stream.parse(bytes.fromhex("0004630007070701") + rec(0, 13, b"")))
+    assert blocks[0] == stream.Record(stream.OWNER_GUI, 99, "?99", None) and blocks[1].owner == 0

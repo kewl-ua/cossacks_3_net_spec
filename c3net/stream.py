@@ -6,6 +6,8 @@ results to the other players. A payload is a sequence of blocks:
     00 03 OO SS 00 <body> 01    a record of a script state machine (8.1):
                                 OO owner (player 0-11, 14 = "progress"),
                                 SS section index in the machine's .aix file
+    00 04 SS SS <body> 01       a record of the GUI machine (menu.aix): no owner,
+                                a u16 section (66 = ReadPause)
     09 <u24> <u32 n> <n units>  unit state sync (8.7)
 
     >>> for block in parse(payload):
@@ -21,6 +23,7 @@ OWNER_ENV = 12                # gc_playerind_env: fields, trees
 OWNER_MISC = 13               # gc_playerind_misc
 OWNER_PROGRESS = 14           # gc_playerind_progress: the "progress" machine
 OWNER_POOL = 15               # gc_playerind_pool
+OWNER_GUI = 0x100             # GUI records (00 04 ...) have no owner byte: this stands for their machine
 
 RESOURCES = (None, "food", "wood", "stone", "gold", "iron", "coal")  # gc_resource_type_* (0 = none)
 
@@ -49,6 +52,8 @@ GLOBAL_SECTIONS = {
     70: "ReadTradeResources",
 }
 PROGRESS_SECTIONS = {8: "ReadRes", 10: "ReadStats", 12: "ReadScenario", 15: "ReadLanSyncData"}
+# data/gui/menu.aix: the host's pause, speed, peace mode and save, broadcast to the players
+GUI_SECTIONS = {64: "ReadTimeSpeed", 66: "ReadPause", 68: "ReadPeacemode", 70: "ReadSave"}
 
 # gc_obj_order_type_*
 ORDER_TYPES = {
@@ -64,7 +69,7 @@ class Short(ValueError):
 
 
 class Record(NamedTuple):
-    owner: int                 # player slot 0-11, or OWNER_PROGRESS
+    owner: int                 # player slot 0-11, OWNER_PROGRESS, or OWNER_GUI
     section: int               # section index in the owner's .aix
     name: str                  # "ReadNew", "ReadStats"... ("?<n>" if not a known section)
     fields: Optional[dict]     # None: no layout known (skipped to the next block)
@@ -186,6 +191,13 @@ def read_lan_sync(b: Buf) -> dict:
 
 
 PROGRESS_RECORDS = {8: read_res, 10: read_stats, 15: read_lan_sync}
+
+GUI_RECORDS = {
+    64: lambda b: {"speed": b.float(), "mode": b.int()},
+    66: lambda b: {"pause": b.boolean()},
+    68: lambda b: {"peace": b.boolean()},
+    70: lambda b: {"map": b.string(), "replay": b.string(), "origin": b.string()},
+}
 
 
 # ------------------------------------------------------------ players' machines
@@ -319,16 +331,21 @@ def sync_block(data: bytes, pos: int = 0) -> tuple:
     return Sync(key, units), pos
 
 
-def _is_record_start(data: bytes, pos: int) -> bool:
-    return data[pos:pos + 2] == b"\x00\x03" and pos + 5 <= len(data) and data[pos + 4] == 0
+def _record_head(data: bytes, pos: int) -> Optional[tuple]:
+    """(owner, section, body position) of a record header at `pos`, or None."""
+    if data[pos:pos + 2] == b"\x00\x03" and pos + 5 <= len(data) and data[pos + 4] == 0:
+        return data[pos + 2], data[pos + 3], pos + 5
+    if data[pos:pos + 2] == b"\x00\x04" and pos + 5 <= len(data):
+        return OWNER_GUI, data[pos + 2] | data[pos + 3] << 8, pos + 4
+    return None
 
 
-def _boundary(data: bytes, pos: int) -> Optional[int]:
-    """The end marker (01) of the record at `pos` whose layout is unknown: the one before a block that parses."""
-    q = data.find(b"\x01", pos + 5)
+def _boundary(data: bytes, body: int) -> Optional[int]:
+    """The end marker (01) of the record whose layout is unknown: the one before a block that parses."""
+    q = data.find(b"\x01", body)
     while q >= 0:
         nxt = q + 1
-        if nxt == len(data) or _is_record_start(data, nxt):
+        if nxt == len(data) or _record_head(data, nxt):
             return q
         if data[nxt] == 0x09:
             try:
@@ -341,7 +358,7 @@ def _boundary(data: bytes, pos: int) -> Optional[int]:
 
 
 def record_name(owner: int, section: int) -> str:
-    names = PROGRESS_SECTIONS if owner == OWNER_PROGRESS else GLOBAL_SECTIONS
+    names = {OWNER_PROGRESS: PROGRESS_SECTIONS, OWNER_GUI: GUI_SECTIONS}.get(owner, GLOBAL_SECTIONS)
     return names.get(section, f"?{section}")
 
 
@@ -356,12 +373,13 @@ def parse(data: bytes) -> Iterator[Block]:
                 return
             yield block
             continue
-        if not _is_record_start(data, pos):
+        head = _record_head(data, pos)
+        if not head:
             return
-        owner, section = data[pos + 2], data[pos + 3]
-        grammar = (PROGRESS_RECORDS if owner == OWNER_PROGRESS else GLOBAL_RECORDS).get(section)
+        owner, section, body = head
+        grammar = {OWNER_PROGRESS: PROGRESS_RECORDS, OWNER_GUI: GUI_RECORDS}.get(owner, GLOBAL_RECORDS).get(section)
         if grammar:
-            b = Buf(data, pos + 5)
+            b = Buf(data, body)
             try:
                 fields = grammar(b)
                 if b.pos < len(data) and data[b.pos] == 0x01:
@@ -370,7 +388,7 @@ def parse(data: bytes) -> Iterator[Block]:
                     continue
             except (Short, UnicodeDecodeError):
                 pass
-        end = _boundary(data, pos)
+        end = _boundary(data, body)
         yield Record(owner, section, record_name(owner, section), None)
         if end is None:
             return

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Revision | 0.2, 2026-09-26 |
+| Revision | 0.3, 2026-09-26 |
 | Game version | 2.2.3 (core 1.0.0.7), unmodded scripts (room checksum `3EEB`) |
 | Status | Reverse-engineered; checked on recorded matches |
 | Reference implementation | [`c3net`](c3net/) (Python, this repository) |
@@ -39,7 +39,7 @@ were checked against recorded matches.
 - [7. Room data](#7-room-data)
   - [7.1 Game name](#71-game-name) · [7.2 Lobby status](#72-lobby-status) · [7.3 Teams](#73-teams) · [7.4 Result codes](#74-result-codes)
 - [8. The match stream (`0x04B0 LAN_RECORD`)](#8-the-match-stream-0x04b0-lan_record)
-  - [8.1 Block construction](#81-block-construction) · [8.2 Owners](#82-owners) · [8.3 Record types](#83-record-types) · [8.4 Body values](#84-body-values) · [8.5 Progress records](#85-progress-records) · [8.6 Player records](#86-player-records) · [8.7 Sync block](#87-sync-block) · [8.8 Decoding robustly](#88-decoding-robustly)
+  - [8.1 Block construction](#81-block-construction) · [8.2 Owners](#82-owners) · [8.3 Record types](#83-record-types) · [8.4 Body values](#84-body-values) · [8.5 Progress records](#85-progress-records) · [8.6 Player records](#86-player-records) · [8.7 Sync block](#87-sync-block) · [8.8 Decoding robustly](#88-decoding-robustly) · [8.9 GUI records](#89-gui-records)
 - [9. What the data means](#9-what-the-data-means)
 - [10. QLREC1 recordings](#10-qlrec1-recordings)
 - [11. Enumerations](#11-enumerations)
@@ -1036,7 +1036,8 @@ in front. The first byte of a block — its **signature** — tells its type:
 
 | Signature | Block |
 |---|---|
-| `0x00 0x03` | record |
+| `0x00 0x03` | record of a player's or the progress machine |
+| `0x00 0x04` | record of the GUI machine (8.9) |
 | `0x09` | sync block |
 
 **Record:**
@@ -1049,10 +1050,27 @@ in front. The first byte of a block — its **signature** — tells its type:
 struct record
 {
     uint8_t  signature;       // 0x00
-    uint8_t  kind;            // 0x03 (always, in 2.2.3)
+    uint8_t  kind;            // 0x03: a player's or the progress machine; 0x04: the GUI machine, below
     uint8_t  owner;           // the machine: 8.2
     uint16_t section;         // index of the Read* section in the owner's .aix: 8.3
     uint8_t  body[];          // what the matching Write* section wrote: 8.5, 8.6
+    uint8_t  end;             // 0x01
+};
+```
+
+**GUI record** (8.9), from the game's menu machine. It has no owner byte:
+
+```
+0x00 ~~~ 0x04 ~~~ Section ~~~ Body ~~~ 0x01
+```
+
+```cpp
+struct gui_record
+{
+    uint8_t  signature;       // 0x00
+    uint8_t  kind;            // 0x04
+    uint16_t section;         // index of the Read* section in data/gui/menu.aix
+    uint8_t  body[];
     uint8_t  end;             // 0x01
 };
 ```
@@ -1088,7 +1106,8 @@ struct sync_block
   happened.
 - **Time:** the stream has no timestamp. Take the first `LAN_RECORD` of the
   match as game time 0 (the map has loaded). In matches with more than one
-  human, parser 16 (6.3.3) gives the host's game time every 5 s.
+  human, parser 16 (6.3.3) gives the host's game time every 5 s. The host's
+  pauses (8.9) stop the game, not the clock: subtract them (9.7).
 
 ### 8.2 Owners
 
@@ -1600,16 +1619,63 @@ decode(payload):
     while pos < len(payload):
         if payload[pos] == 0x09:                      # sync block
             decode entries; if any flag in 0xE0 or data runs out: stop
-        elif payload[pos:pos+2] == 00 03 and payload[pos+4] == 0x00:   # record
+        elif payload[pos:pos+2] == 00 03 and payload[pos+4] == 0x00    # record, body at pos+5
+          or payload[pos:pos+2] == 00 04:                                # GUI record, body at pos+4
             if the section's layout is known and the body ends right before a 0x01:
                 emit it; pos = after the 0x01
             else:
-                q = next 0x01 after the header
+                q = next 0x01 from the body on
                 until q is followed by: the end, a record header, or a sync block that decodes
                     q = next 0x01
                 emit "unknown record"; pos = q + 1
         else:
             stop
+```
+
+### 8.9 GUI records
+
+Records with the signature `0x00 0x04` (8.1) belong to the game's menu
+machine, `data/gui/menu.aix`. They carry what the host changes for the whole
+match. The host broadcasts them; a client sends one to ask for a change.
+
+| Section | Name | Carries |
+|---|---|---|
+| `0x0040` | `ReadTimeSpeed` | the game speed |
+| `0x0042` | `ReadPause` | the pause |
+| `0x0044` | `ReadPeacemode` | peace mode |
+| `0x0046` | `ReadSave` | a save of the match (switched off online in 2.2.3) |
+
+#### 0x0040 ReadTimeSpeed
+
+```cpp
+float   speed;                // the time speed factor
+int32_t mode;                 // gc_settings_gamespeed index: 0 normal, 1 fast, 2 very fast
+```
+
+#### 0x0042 ReadPause
+
+```cpp
+bool8_t pause;                // in the host's broadcast: the new state
+```
+
+- A player's game that wants to pause sends this record to the host; the
+  host **toggles** its pause, whatever the Boolean says, and broadcasts the
+  new state. So any record here from a client toggles the pause.
+- The game's limit (4 pauses per 2 minutes, `gc_pause_countlimit`,
+  `gc_pause_timelimit`) is checked only when the key is pressed.
+
+#### 0x0044 ReadPeacemode
+
+```cpp
+bool8_t peace;
+```
+
+#### 0x0046 ReadSave
+
+```cpp
+str16_t map;                  // the save's name: every player saves the same
+str16_t replay;
+str16_t origin;               // the map it started from
 ```
 
 ---
@@ -1624,7 +1690,8 @@ decode(payload):
 | starting unit (18 peasants by default) | the map start, never announced | the nearest town centre; they move from the first seconds |
 | building | `ReadConstruct` | the record's owner. Its uid: the first new uid in a sync block within ~1 unit of (x, z), at or after the placement |
 | field | `ReadNewP` | the record's owner (the uid's owner is the environment) |
-| tree, stone, map object | the map | nobody; they never move |
+| tree, stone, map object | the map | nobody; they never move (9.9) |
+| any of these, captured | `ReadPlayer` (`0x13`) from the host | the record's owner, from then on (9.8) |
 
 - Unit and building codes are the nation's **members** in `country.script`
   (`_country_AddMember`).
@@ -1728,7 +1795,55 @@ its rules:
 | an object dies | − 2 × its score for the owner (a building only if it was finished); never below 0 |
 | a kill | + 2 × the victim's score for the killer |
 
+| an object is captured | + 5 × its score for the new owner, − 5 × for the old one (never below 0) |
+
 The end screen shows the score divided by 100.
+
+### 9.7 Pauses and game time
+
+- The host's `ReadPause` (8.9) broadcasts give the pauses: `true` when the
+  game stops, `false` when it goes on. Only the host sends them, whoever
+  pressed the key.
+- During a pause the stream nearly stops, but real time goes on. Game time
+  is the arrival time minus the pauses before it. Without that, everything
+  after a pause is late by the pause's length.
+
+A match with two pauses (seconds after the first `LAN_RECORD`):
+
+| Arrival | Record | Game time |
+|---|---|---|
+| 150.0 | `00 04 42 00 01 01` pause on | 150.0 |
+| 154.9 | `00 04 42 00 00 01` pause off | 150.0 |
+| 576.0 | pause on | 571.1 |
+| 587.1 | pause off | 571.1 |
+
+### 9.8 Captures
+
+`ReadPlayer` (`0x13`, `uid`, `capture`) from the host: the record's owner
+takes the object. Peasants and buildings are taken this way.
+
+- From then on the object is the new owner's. When it dies, the game counts
+  it in **the new owner's** losses (the end screen lists it with its
+  nation: "Poland, town centre").
+- Its score moves: + 5 × to the new owner, − 5 × from the old one
+  (`_unit_AddObjToPlayerCounters` / `_unit_RemoveObjFromPlayerCounters`
+  with `bcaptured`).
+
+### 9.9 The map's objects
+
+The host's **first big sync block** (about 10 000 entries on a 1×1 map) is
+a snapshot of the whole world when the match starts. It includes the map's
+objects, which never move:
+
+- State tag `0x00000001` (`essential_none` only): **trees**. They die
+  (`essential_death`) when felled; a tree holds a lot of wood, so 5–25
+  fall in a match.
+- State tag `0x00000000`: other objects with no state; they never change.
+- The starting units are there too, with more state bits.
+
+Heights are not in the stream. A random map is generated from its seed
+(`gMap.settings.gen.randkey0`, `randkey1`), which the host sends in parser 1
+(`LAN_GENERATE`) only when the room has more than one human.
 
 ---
 
@@ -1955,6 +2070,17 @@ dd 26 00 00      target 9949
 09 55 b6 01  01 00 00 00  89 00 00  18  04 00 00 00     uid 137: essential_death
 ```
 
+**`ReadPause`**: the host stops the game, then goes on 4.9 s later.
+
+```
+00 04        GUI record
+42 00        section 0x0042: ReadPause
+01           pause: on
+01           end
+...
+00 04 42 00  00  01   pause: off
+```
+
 ---
 
 ## Appendix B. Reference implementation
@@ -1980,5 +2106,6 @@ python -m c3net upgrades "C:/Games/Cossacks 3"
 
 | Revision | Date | Changes |
 |---|---|---|
+| 0.3 | 2026-09-26 | GUI records (signature `0x00 0x04`, 8.9): pause, game speed, peace mode, save. Pauses and game time (9.7), captures (9.8), the map's objects in the first snapshot (9.9). |
 | 0.2 | 2026-09-26 | Every lobby message code, with direction and payload structs. Parser definitions, including the game clock (parser 16). Record types by hex section, with a struct for each. Sync flags and state tags as bit tables, the robust decoding algorithm, sequence and state diagrams. **Corrections:** `ReadProduce` with a negative `amount` is infinite production, not a cancellation (`state` = 0 is); the room datasync comes as `SERVER_SESSION_PARSER`, which reaches the whole room, not only the master. |
 | 0.1 | 2026-09-26 | First version. |
