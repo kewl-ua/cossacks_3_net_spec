@@ -1661,6 +1661,10 @@ bool8_t pause;                // in the host's broadcast: the new state
 - A player's game that wants to pause sends this record to the host; the
   host **toggles** its pause, whatever the Boolean says, and broadcasts the
   new state. So any record here from a client toggles the pause.
+- The host takes it only from a player of its room. Sent by a lobby server
+  with the frame's `id_from` = 0, it was ignored; with the id of the other
+  player in the room, it paused the match for both, and a second one went
+  on (a live match, 2026-09-26).
 - The game's limit (4 pauses per 2 minutes, `gc_pause_countlimit`,
   `gc_pause_timelimit`) is checked only when the key is pressed.
 
