@@ -2150,6 +2150,7 @@ python -m c3net upgrades "C:/Games/Cossacks 3"
 
 | Revision | Date | Changes |
 |---|---|---|
+| 0.3.1 | 2026-09-27 | No protocol change. `c3net.dmscript` runs the engine's list classes (`TIntegerList` and the like: `Add`, `Get`, `IndexOf`, `Delete`, `GetCount`…, arrays of them) and computes `mod` with the dividend's sign, as Pascal does. |
 | 0.3 | 2026-09-26 | GUI records (signature `0x00 0x04`, 8.9): pause, game speed, peace mode, save. Pauses and game time (9.7), captures (9.8), the map's objects in the first snapshot (9.9). |
 | 0.2 | 2026-09-26 | Every lobby message code, with direction and payload structs. Parser definitions, including the game clock (parser 16). Record types by hex section, with a struct for each. Sync flags and state tags as bit tables, the robust decoding algorithm, sequence and state diagrams. **Corrections:** `ReadProduce` with a negative `amount` is infinite production, not a cancellation (`state` = 0 is); the room datasync comes as `SERVER_SESSION_PARSER`, which reaches the whole room, not only the master. |
 | 0.1 | 2026-09-26 | First version. |

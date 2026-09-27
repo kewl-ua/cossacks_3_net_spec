@@ -227,6 +227,28 @@ def test_dmscript_interpreter():
     assert consts == {"gc_a": 2, "gc_b": 16}
 
 
+def test_dmscript_lists_and_mod():
+    from c3net import dmscript
+    # the engine's list classes (the map generator's RandomStartingPoints uses them), and Pascal's mod
+    src = """
+    procedure Pick(var out : Integer);
+    begin
+       var points : TIntegerList;
+       var teams : array [0..4] of TIntegerList;
+       var i : Integer;
+       for i:=0 to 3 do
+       points.Add(i*10);
+       points.Delete(1);
+       teams[2].Add(points.Get(points.GetCount-1));
+       out := teams[2].Get(0) + points.IndexOf(20) * 100 + ((-7) mod 3) * 1000;
+    end;
+    """
+    interp = dmscript.Interpreter([src])
+    out = dmscript.Cell(0)
+    interp.invoke(interp.globals.find("pick"), [out.get], [dmscript.RefCell(out.get, out.set)])
+    assert out.get() == 30 + 1 * 100 + (-1) * 1000  # [0, 20, 30]: last 30, IndexOf(20) = 1, -7 mod 3 = -1
+
+
 def test_gui_records():
     # the host's pause, as in a recorded match: 00 04, section 66 (u16), the Boolean, 01; a record after it
     payload = bytes.fromhex("000442000101") + rec(stream.OWNER_PROGRESS, 8, b"\x01\x00\x02\x02\x81")

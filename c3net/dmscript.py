@@ -85,10 +85,11 @@ EMPTY = _Empty()
 class Box:
     """A record, object or array: fields and items appear on first use."""
 
-    __slots__ = ("fields", "items")
+    __slots__ = ("fields", "items", "make")
 
-    def __init__(self):
+    def __init__(self, make=None):
         self.fields, self.items = {}, {}
+        self.make = make  # what a new item is (arrays of lists); a Box by default
 
     def get_field(self, name):
         if name not in self.fields:
@@ -97,7 +98,7 @@ class Box:
 
     def get_item(self, key):
         if key not in self.items:
-            self.items[key] = Box()
+            self.items[key] = self.make() if self.make else Box()
         return self.items[key]
 
     def __bool__(self):
@@ -514,8 +515,55 @@ class Parser:
 
 # ---------------------------------------------------------------- interpreter
 
+class ListObj:
+    """TIntegerList / TStringList / TFloatList: the engine's list classes, by their methods."""
+
+    def __init__(self):
+        self.items = []
+
+    def method(self, name, args):
+        name = name.lower()
+        if name == "add":
+            self.items.append(plain(args[0]))
+            return len(self.items) - 1
+        if name == "get":
+            i = int(num(args[0]))
+            return self.items[i] if 0 <= i < len(self.items) else 0
+        if name == "set":
+            self.items[int(num(args[0]))] = plain(args[1])
+            return None
+        if name in ("getcount", "count"):
+            return len(self.items)
+        if name == "indexof":
+            v = plain(args[0])
+            return self.items.index(v) if v in self.items else -1
+        if name == "delete":
+            i = int(num(args[0]))
+            if 0 <= i < len(self.items):
+                del self.items[i]
+            return None
+        if name == "insert":
+            self.items.insert(int(num(args[0])), plain(args[1]))
+            return None
+        if name == "clear":
+            self.items.clear()
+            return None
+        return EMPTY
+
+    def get_field(self, name):
+        return self.method(name, [])
+
+    def __bool__(self):
+        return True
+
+
 def default_for(typ):
     typ = (typ or "").strip()
+    if typ.endswith("list") and typ.startswith("t") and " " not in typ:
+        return ListObj()
+    m = re.match(r"array .* of (t\w*list)$", typ)
+    if m:
+        return Box(make=ListObj)
     if typ in ("integer", "word", "byte", "cardinal", "longint", "int64", "float", "single", "double", "real"):
         return 0
     if typ == "string":
@@ -693,6 +741,8 @@ class Interpreter:
     def container(self, node, env):
         getter, setter = self.locate(node, env)
         value = getter()
+        if isinstance(value, ListObj):
+            return value
         if not isinstance(value, Box):
             value = Box()
             setter(value)
@@ -768,8 +818,8 @@ class Interpreter:
             return num(a) / num(b) if num(b) else 0
         if op == "div":
             return int(num(a) / num(b)) if num(b) else 0
-        if op == "mod":
-            return num(a) % num(b) if num(b) else 0
+        if op == "mod":  # Pascal: the sign of the dividend
+            return num(a) - num(b) * int(num(a) / num(b)) if num(b) else 0
         if op == "shl":
             return num(a) << num(b)
         if op == "shr":
@@ -787,8 +837,13 @@ class Interpreter:
 
     def call_node(self, node, env):
         _, target, args = node
+        if target[0] == "field":
+            base = self.eval(target[1], env)
+            if isinstance(base, ListObj):
+                return base.method(target[2], [self.eval(a, env) for a in args])
+            return EMPTY  # other method calls on objects: nothing we need
         if target[0] != "name":
-            return EMPTY  # method calls on objects: nothing we need
+            return EMPTY
         name = target[1]
         proc = env.find(name)
         if isinstance(proc, Proc):
