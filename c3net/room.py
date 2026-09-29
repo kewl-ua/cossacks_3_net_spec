@@ -5,14 +5,15 @@ from typing import Optional
 
 SLOTS = 12  # gc_MaxPlayerCount
 
-# generator settings, in datasync order (value -> meaning)
-SEASON = {0: "summer", 1: "winter", 2: "desert"}
+# generator settings, in datasync order (value -> meaning), as the game's custom-game combo
+# boxes store them (showcustomgame.inc, dmscript.global gc_Max*Count); "random" is the room's choice
+SEASON = {0: "summer", 2: "winter", 3: "desert", -1: "random"}
 TERRAIN = {0: "land", 1: "mediterranean", 2: "peninsulas", 3: "islands", 4: "continents", 5: "continent",
-           6: "lakes", 7: "coast", 8: "rivers", 9: "no water"}
-RELIEF = {0: "plain", 1: "hills", 2: "mountains", 3: "highlands", 4: "plateau", 5: "desert"}
-START_RESOURCES = {0: "normal", 1: "rich", 2: "thousands", 3: "millions"}
-MINES = {0: "few", 1: "medium", 2: "many"}
-MAP_SIZE = {3: "small", 0: "normal", 1: "large (2x)", 2: "huge (4x)"}
+           6: "coast", 7: "lakes", 8: "rivers", 9: "random"}
+RELIEF = {0: "plain", 1: "hills", 2: "mountains", 3: "highlands", 4: "plateau", 5: "random"}
+START_RESOURCES = {0: "normal", 1: "rich", 2: "thousands", 3: "millions", 4: "random"}
+MINES = {0: "few", 1: "medium", 2: "many", 3: "random"}
+MAP_SIZE = {3: "tiny", 0: "normal", 1: "large (2x)", 2: "huge (4x)"}
 GENERATOR = [("season", SEASON), ("terrain", TERRAIN), ("relief", RELIEF), ("resources", START_RESOURCES),
              ("mines", MINES), ("size", MAP_SIZE)]
 

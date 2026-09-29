@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Revision | 0.3, 2026-09-26 |
+| Revision | 0.4, 2026-09-29 |
 | Game version | 2.2.3 (core 1.0.0.7), unmodded scripts (room checksum `3EEB`) |
 | Status | Reverse-engineered; checked on recorded matches |
 | Reference implementation | [`c3net`](c3net/) (Python, this repository) |
@@ -62,14 +62,20 @@ Covered:
 - room data: the game name, the lobby status string, the room datasync;
 - the match stream: its signature bytes, its two block types and the layout
   of every record;
-- what the values mean, including traps in the game's own statistics.
+- what the values mean, including traps in the game's own statistics;
+- the random map: the random numbers its generator draws, how the seed
+  picks the terrain mask, the starting points and the patterns, the
+  heights, and how to recover the seed of a match that never sent it (9.10).
 
 Not covered:
 
 - the payloads of the social messages (friends, chats, clans, members,
   admins, stats: codes `0x01C2`–`0x01DF`). They are listed, but their layout
   is not documented.
-- saved games, map generation, historical battles.
+- saved games and historical battles;
+- the map generator's scripts themselves: they are the game's. 9.10
+  describes how the seed drives them, the pattern file and a height
+  model.
 
 ### 1.2 Verification
 
@@ -82,6 +88,10 @@ Not covered:
 - **Two humans:** checked on a match of two players (and two computers):
   the client's requests to the host (8.3), parser 16 (6.3.3), parser 1
   (6.3.5) and a lobby server's pause (8.9).
+- **The random map** (9.10): maps generated from the seed were compared
+  with the host's first snapshot. On a two-human match, whose seed came in
+  parser 1, 99.7 % of the generated objects match. On a one-human match,
+  whose seed was recovered, 99.1 % match.
 
 ### 1.3 Conventions
 
@@ -888,12 +898,12 @@ Spectators hold a slot with nation −2.
 
 | # | Field | Values |
 |---|---|---|
-| 13 | season | 0 summer, 1 winter, 2 desert |
-| 14 | terrain | 0 land, 1 mediterranean, 2 peninsulas, 3 islands, 4 continents, 5 continent, 6 lakes, 7 coast, 8 rivers, 9 no water |
-| 15 | relief | 0 plain, 1 hills, 2 mountains, 3 highlands, 4 plateau, 5 desert |
-| 16 | starting resources | 0 normal, 1 rich, 2 thousands, 3 millions |
-| 17 | mines | 0 few, 1 medium, 2 many |
-| 18 | map size | 3 small, 0 normal, 1 large (2×), 2 huge (4×) |
+| 13 | season | 0 summer, 2 winter, 3 desert, −1 random |
+| 14 | terrain | 0 land, 1 mediterranean, 2 peninsulas, 3 islands, 4 continents, 5 continent, 6 coast, 7 lakes, 8 rivers, 9 random |
+| 15 | relief | 0 plain, 1 hills, 2 mountains, 3 highlands, 4 plateau, 5 random |
+| 16 | starting resources | 0 normal, 1 rich, 2 thousands, 3 millions, 4 random |
+| 17 | mines | 0 few, 1 medium, 2 many, 3 random |
+| 18 | map size | 3 tiny, 0 normal, 1 large (2×), 2 huge (4×) |
 
 **Additional settings** (`gMap.settings.additional`):
 
@@ -993,7 +1003,8 @@ follow the script's `TMap` class:
 ```
 
 A recorded match: `randkey0 = 0`, `randkey1 = 763381496`, `mapsize = 3`
-(small), `terraintype = 0` (land), `relieftype = 2` (mountains).
+(tiny), `terraintype = 0` (land), `relieftype = 2` (mountains). What the
+seed gives: [9.10](#910-the-random-map).
 
 #### 6.3.4 102 LAN_ROOM_CLIENT_DATACHANGE
 
@@ -1887,7 +1898,242 @@ objects, which never move:
 
 Heights are not in the stream. A random map is generated from its seed
 (`gMap.settings.gen.randkey0`, `randkey1`), which the host sends in parser 1
-(`LAN_GENERATE`) only when the room has more than one human.
+(`LAN_GENERATE`) only when the room has more than one human. The objects
+here are what checks a map generated from the seed:
+[9.10](#910-the-random-map).
+
+### 9.10 The random map
+
+The stream carries the map's recipe, not the map. With the recipe and the
+game's own generator scripts, a program can rebuild a random map: its
+objects exactly, and its heights closely.
+
+#### The seed
+
+- **Where it is:** `gMap.settings.gen.randkey0` and `randkey1` in parser 1
+  ([6.3.5](#635-1-lan_generate)), with the generator settings next to them
+  (`mapsize`, `terraintype`, `relieftype`, `season`, …).
+- **When it is sent:** the host sends parser 1 only when the room has more
+  than one human.
+- **What depends on which key:** the mask, the starting points and the
+  relief patterns depend on `randkey1` alone.
+  - In the generator scripts, `randkey0` reaches only
+    `SetRandomExtKey64(randkey0, randkey1)`. `generatemap.inc` calls it right
+    after the mask pick and again before the terrain texturing.
+  - Random mines (`resourcemines` 3) are drawn from that state after the
+    texturing. So with them, the mines and the patterns after them depend
+    on `randkey0` too, which the reference model does not reproduce.
+  - `DoNewGame` also hands both keys to engine functions whose use of them
+    is not known.
+  - The recorded match had `randkey0 = 0`.
+- **One human** against computers: the seed is not in the stream, but it can
+  be recovered from it (below).
+
+#### RandomExt
+
+Every random number that decides the map's layout comes from the engine's
+`RandomExt`. Object scales, set after generation, use the plain `random`.
+The starting units are scattered with `RandomExt`, but between two key
+resets, so nothing else moves.
+
+The state `S` is a signed 64-bit integer. Below, **draw n** is the n-th
+`RandomExt` call after the last key reset, and **Single** is a 32-bit IEEE
+`float`.
+
+| Function | What it does |
+|---|---|
+| `SetRandomKey(k)` | `S = k`, the 32-bit key sign-extended |
+| `SetRandomExtKey64(k0, k1)` | `S = k0 << 32 \| k1`, as a signed 64-bit integer (k1 unsigned in the reference implementation; not checked against the engine) |
+| `RandomExt()` | `S = (S × 64525 + 1013904223) mod 2³²`, then returns `Single(S / 2³²)` |
+
+- **The `mod` takes the sign of the dividend**, as Delphi's does. The
+  product is computed in signed 64 bits; it wraps only for states above
+  2⁴⁷, which a 32-bit key never reaches.
+- **For 0 ≤ S < 2³²** this is a plain linear congruential generator mod 2³².
+  - Every draw lies in [0, 1]. A state of 2³² − 128 or more rounds to exactly
+    1.0 in Single precision, which happens once in 2²⁵ draws, so
+    `floor(r × n)` can be `n`.
+- **A key of 2³¹ or more** is negative after the sign extension.
+  - For all but the last 15 713 keys, the first draws are negative, and
+    the mask pick fails.
+  - Those last 15 713 keys (−15 713 … −1 as signed values) turn positive on
+    the first draw and give a valid map.
+- **n draws are one affine map** `S → a·S + c mod 2³²`, so a program can
+  jump ahead in O(log n).
+- **The generator is a single cycle** of length 2³². The increment is odd
+  and 64 524 is divisible by 4, which is the Hull–Dobell condition. So any
+  two seeds give the same sequence, shifted.
+
+`VectorRotateY(x, y, z, a)` turns the vector (x, z) about the vertical axis;
+y is unchanged:
+
+- `x' = cos a · x + sin a · z`;
+- `z' = cos a · z − sin a · x`;
+- `a` is in degrees, and the arithmetic is in Single precision.
+
+The generator uses it to place mines and starting resources at a random
+angle around a starting point, and to jitter each custom starting unit
+around its own spot. Patterns on a random map all stand at angle 0.
+
+The map is square. Its width in cells, **W**, by `mapsize`:
+
+| `mapsize` | 0 | 1 | 2 | 3 | other |
+|---|---|---|---|---|---|
+| Name in the game | normal | large | huge | tiny | |
+| W | 320 | 480 | 640 | 256 | 320 |
+
+#### How the seed drives the generator (2.2.3)
+
+The generator is the game's script:
+
+- `data/scripts/common.inc/dogenerate.inc` and `generatemap.inc`;
+- their helpers in `data/scripts/lib/misc.script`: `_misc_SetupPatternsByType`,
+  `_misc_GetPatternNameByParser` (the name draw), `_misc_PatternIncreaseFreq`,
+  `_misc_GetFreePatternMaskModifier`, `_misc_CheckStandPattern`.
+
+The draw numbers below assume a chosen terrain type and relief. The room can
+also pick Random for either, and each Random spends one extra draw (below).
+Random mines work as described under The seed.
+In order:
+
+1. **The terrain mask.** After `SetRandomKey(randkey1)`, draw 1 picks it.
+   - With Random terrain (`terraintype` 9), draw 1 picks the terrain type
+     instead, `floor(r × 9)`, and draw 2 picks the mask.
+   - The candidates are the files `<n>pl*.tga` in the terrain type's mask
+     folder (`TerrainTypesDLC5` in `data/game/var/generator.cfg`), in plain
+     string order (`_10_` sorts before `_1_`).
+   - `n` is the smallest player count that has files and is at least the
+     number of players, computers included (spectators are not players).
+   - The pick is `floor(r × count)`.
+   - The mask's white pixels are the starting points, in scan order (top row
+     first, left to right). A pixel at (x, y) of a mask of
+     `width × height` stands at `(−(W div 2) + x / width × W,
+     −(W div 2) + y / height × W)`.
+   - The other colours mark the terrain: red for plateau, hill and ravine,
+     green for forest and stone, blue for water. Every pixel that is neither
+     black nor white is closed to patterns.
+2. **The starting points**, when teams are not placed side by side.
+   - The key is reset to `randkey1` before each player's pick.
+   - Player i (from 0, in slot order, spectators skipped) takes draw
+     i + 10 among the points left: `floor(r × points)` for the first player,
+     `floor(r × (points − 1))` for the second, and so on.
+   - The player's starting resources and first round of mines stand right
+     after the pick.
+3. **The patterns.** The key is reset to `randkey1` again. With Random relief
+   (`relieftype` 5), one draw picks the relief first, `floor(r × 5)`. Then:
+   - `_misc_GetFreePatternMaskModifier` takes exactly 1 024 000 draws: 4
+     square sizes × 4 rounds × 32 000 tries × 2 draws, whatever it finds.
+   - Then come the relief groups, in a fixed order: `mountains` first, then
+     plateau_big, plain_huge, ravine_big, plateau, plateau_small,
+     hills_dark, hills_light. So the first mountain's name is the first draw
+     after the 1 024 000.
+   - A desert season (`season` 3) stands its own groups instead:
+     desert_mountains, desert_plateau_big, desert_plain_big,
+     desert_plateau, desert_plateau_small.
+   - A group stands `floor(W² × d)` patterns, or `round()` of it when that
+     gives 0. Here d is the density `dogenerate.inc` passes for the group:
+     the relief type's value, × a factor from the pattern mask, × 640 / W.
+     Each pattern goes like this:
+     - a name draw by frequency: the group's frequencies are walked down with
+       `r × sum`, and a pattern that has stood gets 0.2 × its frequency, at
+       least 0.0001;
+     - then position tries of two draws each, `x = floor(−(W div 2) + r × W)`
+       and then `z` the same way, until the pattern fits (stands);
+     - the tries per pattern are limited to `floor(256 × f)`, with
+       `f = 320² / W²`, and × 0.65 when `f < 1`.
+   - Then the further rounds of mines go around every starting point of the
+     mask, taken or not.
+   - The key is reset to `randkey1` again before the forests, stones,
+     plains, swamps and lakes, which follow the same rules.
+4. **The heights**, as the reference model builds them.
+   - The mask gives the base heights ("Load height data from texture" in
+     `generatemap.inc`), and the script smooths them before any pattern
+     stands.
+   - Each stood pattern whose `HeightFieldStand` is True adds its height
+     field × `HeightFieldScale` at its place. `HeightFieldReplace` would set
+     it instead, but no pattern of 2.2.3 has it.
+   - Left out of the reference model: the smoothing, and the engine's
+     per-pattern `HeightFieldSmooth`, `HeightFieldReplaceForWater`,
+     `HeightFieldMin` and `HeightFieldMax`.
+   - This model correlates at 0.96 with measured heights (below).
+5. **The objects.** Each pattern also carries objects, trees above all. They
+   are what the first snapshot (9.9) holds, and what checks a generated map.
+
+A pattern file, `data/pattern/<name>.pattern`:
+
+| Field | Type |
+|---|---|
+| width, height (vertices) | `int32_t`, `int32_t` |
+| mask, (w − 1) × (h − 1) cells, row by row; 0 = the pattern's body | `uint8_t[]` |
+| heights, w × h; rows in the opposite order to the mask (the first stored row is at the largest z) | `float[]` |
+| more data follows, not described | |
+
+- `data/pattern/pattern.lib` (text) lists each pattern's properties and its
+  objects, as offsets from its centre.
+- The centre is ((w − 1)/2, (h − 1)/2). On an axis with an even size, the
+  objects are offset by 0.5.
+- `GetPatternMaskValue` is true outside the mask. The script's quick check
+  samples every 4th cell up to index w or h, that is up to two past the
+  last cell.
+- A pattern that `generator.cfg` names but the game lacks answers zeros, so
+  its stand check passes at once.
+
+#### Checked
+
+- **Two-human match**, seed 763381496, sent in parser 1 (land, mountains,
+  tiny, 4 players):
+  - 99.7 % of the 6 211 objects the generated patterns carry lie within 0.3
+    cells of an object in the first snapshot;
+  - all 6 182 snapshot objects are explained;
+  - the heights correlate at 0.96 with the heights of the computers'
+    artillery shots ([`ReadProj`](#0x29-readproj)).
+- **One-human match**, seed 1459813462, recovered as below:
+  - 99.1 % of 10 211 objects match;
+  - all 10 111 snapshot objects are explained;
+  - the relief agrees with screenshots of the game (checked by eye).
+
+#### Recovering the seed of a one-human match
+
+This works for a chosen terrain, relief and season, and a season other
+than desert. A Random season is settled by `DoNewGame` from the 64-bit key,
+so it is unknown.
+
+1. **Find where the mountains stand** in the first snapshot (9.9). A
+   mountain's objects appear together, at the offsets `pattern.lib` gives.
+   Anchor on one object and check the rest.
+2. **Try every `randkey1`** in 0 … 2³¹ − 1 (the 15 713 valid keys above 2³¹
+   are left out):
+   - keep the seeds whose draw 1 picks a mask whose starting points fit the
+     town centres of the first two players (draws 10 and 11);
+   - jump the 1 024 000 draws, and replay the mountains: the name draw, then
+     position tries until one lands on a cell where a mountain of that name
+     really stands. Tries that miss are only counted. Then the next mountain
+     goes the same way;
+   - the true seed chains every mountain, and a wrong one stops after a few.
+   - QLadder's search in C with OpenMP takes about 10 s for all 2³¹ on 8
+     cores. It is not in this repository.
+3. **Break ties.** Seeds with equally long chains are the true sequence
+   shifted by an even number of draws (the generator is one cycle).
+   - A seed shifted back needs more tries than the true seed to reach the
+     first mountain.
+   - A seed shifted forward, which starts inside the true seed's tries, needs
+     fewer.
+   - Forward shifts are few, at most one per try the true seed spent. Backward
+     shifts can fall anywhere within the try limit.
+   - So rank the candidates by the fewest tries, and confirm the first few
+     with step 4 (QLadder confirms three). This is a heuristic: a
+     forward-shifted seed can still come first.
+4. **Confirm** with a full run of the generator against the snapshot.
+
+It needs six mountains or more. Two cases are not covered:
+
+- Teams placed side by side change the starting-point draws.
+- Custom starting units do not change the draws, but they reserve room in
+  the pattern mask around the starting points (`CreateUniqueStartingUnits`),
+  which the reference model does not reproduce.
+
+[`c3net.randomext`](c3net/randomext.py) has RandomExt, the jump,
+VectorRotateY and the map widths.
 
 ---
 
@@ -2139,6 +2385,7 @@ dd 26 00 00      target 9949
 | `c3net.recording` | QLREC1 files (section 10) |
 | `c3net.upgrades` | upgrade lists rebuilt from an installed game (9.5) |
 | `c3net.dmscript` | an interpreter for the game's script language, enough for `country.script` |
+| `c3net.randomext` | the engine's RandomExt, jumping ahead, VectorRotateY, map widths (9.10) |
 
 ```
 python -m c3net dump match.rec.gz          # every frame, decoded
@@ -2150,6 +2397,7 @@ python -m c3net upgrades "C:/Games/Cossacks 3"
 
 | Revision | Date | Changes |
 |---|---|---|
+| 0.4 | 2026-09-29 | **Correction:** the room datasync's generator values (6.3.1) are the game's combo box values: season 0 summer, 2 winter, 3 desert, −1 random; terrain 6 coast, 7 lakes, 9 random; the last value of relief, starting resources and mines is random; map size 3 is tiny. The random map (9.10): the seed in parser 1, the engine's RandomExt and VectorRotateY, how the seed picks the terrain mask, the starting points and the patterns, the pattern file, the heights, the checks, and how to recover the seed of a one-human match. `c3net.randomext`. |
 | 0.3.1 | 2026-09-27 | No protocol change. `c3net.dmscript` runs the engine's list classes (`TIntegerList` and the like: `Add`, `Get`, `IndexOf`, `Delete`, `GetCount`…, arrays of them) and computes `mod` with the dividend's sign, as Pascal does. |
 | 0.3 | 2026-09-26 | GUI records (signature `0x00 0x04`, 8.9): pause, game speed, peace mode, save. Pauses and game time (9.7), captures (9.8), the map's objects in the first snapshot (9.9). |
 | 0.2 | 2026-09-26 | Every lobby message code, with direction and payload structs. Parser definitions, including the game clock (parser 16). Record types by hex section, with a struct for each. Sync flags and state tags as bit tables, the robust decoding algorithm, sequence and state diagrams. **Corrections:** `ReadProduce` with a negative `amount` is infinite production, not a cancellation (`state` = 0 is); the room datasync comes as `SERVER_SESSION_PARSER`, which reaches the whole room, not only the master. |

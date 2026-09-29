@@ -4,7 +4,7 @@ import struct
 
 import pytest
 
-from c3net import lobby, recording, room, stream, upgrades
+from c3net import lobby, randomext, recording, room, stream, upgrades
 from c3net.__main__ import main
 
 
@@ -258,3 +258,47 @@ def test_gui_records():
     # an unknown GUI section is skipped to the next block
     blocks = list(stream.parse(bytes.fromhex("0004630007070701") + rec(0, 13, b"")))
     assert blocks[0] == stream.Record(stream.OWNER_GUI, 99, "?99", None) and blocks[1].owner == 0
+
+
+def test_randomext():
+    """The engine's RandomExt: values checked by generating recorded matches' maps (9.10)."""
+    r = randomext.RandomExt(763381496)
+    assert [r.next() for _ in range(3)] == [0.8195599317550659, 0.34052926301956177, 0.8864337801933289]
+    assert randomext.RandomExt(0).next() == 0.2360679656267166
+    k = randomext.RandomExt()
+    k.set_key64(0, 763381496)
+    assert k.next() == 0.8195599317550659
+    # SetRandomKey sign-extends: a small negative key comes back positive after one draw
+    assert randomext.RandomExt(-5).next() == 0.23599284887313843
+    # a key of 2^31 or more gives negative first draws, except the last 15 713, which turn positive
+    assert randomext.RandomExt(0x80000001).next() < 0
+    assert randomext.RandomExt(-15713).next() >= 0 and randomext.RandomExt(-15714).next() < 0
+    # a state of 2^32 - 128 or more gives exactly 1.0 in Single precision
+    r1 = randomext.RandomExt()
+    r1.state = (2 ** 32 - 128 - 1013904223) * pow(64525, -1, 2 ** 32) % 2 ** 32
+    assert r1.next() == 1.0
+    # skip(n) is n draws at once
+    a, b = randomext.RandomExt(1459813462), randomext.RandomExt(1459813462)
+    a.skip(12345)
+    for _ in range(12345):
+        b.next()
+    assert a.state == b.state and a.next() == b.next()
+    c = randomext.RandomExt(763381496)
+    c.skip(1024000)                     # the draws the map generator spends before placing mountains
+    assert c.next() == 0.06625831127166748 and c.state == 284577271
+    with pytest.raises(ValueError):
+        randomext.RandomExt(0x80000001).skip(1)
+
+
+def test_rotate_y():
+    assert randomext.rotate_y(3.5, -2.0, 30) == (2.0310888290405273, -3.482050895690918)
+    x, z = randomext.rotate_y(1.0, 0.0, 90)
+    assert abs(x) < 1e-6 and z == -1.0
+
+
+def test_generator_values_are_the_games():
+    """The datasync stores the custom-game combo boxes' values (6.3.1): winter is 2, Random is the last."""
+    assert room.SEASON[2] == "winter" and room.SEASON[3] == "desert" and room.SEASON[-1] == "random"
+    assert room.TERRAIN[6] == "coast" and room.TERRAIN[7] == "lakes" and room.TERRAIN[9] == "random"
+    assert room.RELIEF[5] == room.START_RESOURCES[4] == room.MINES[3] == "random"
+    assert room.MAP_SIZE[3] == "tiny"

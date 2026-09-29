@@ -51,11 +51,13 @@ Upgrade numbers depend on the game's scripts. `python -m c3net upgrades
 
 ## Status
 
-- Revision 0.3 describes version 2.2.3 with unmodded scripts.
+- Revision 0.4 describes version 2.2.3 with unmodded scripts.
 - Every record layout comes from the game's own script handlers.
 - Checked on recorded matches: every block decodes, and the statistics
   balance with the game's end screen.
-- Matches between two humans are not verified yet.
+- Checked on a match between two humans too (spec 1.2). The random map,
+  rebuilt from its seed with the game's own generator scripts, matches the
+  host's snapshot (9.10); `c3net.randomext` has the engine's random numbers.
 - Tests: `python -m pytest tests`.
 
 ## Credits
